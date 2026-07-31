@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import pandas as pd
@@ -14,7 +15,6 @@ import yaml
 from aiconfigurator import __version__
 from aiconfigurator.cli.estimate_detail_report import detail_requests_time, format_estimate_detail_report
 from aiconfigurator.cli.report_and_save import log_final_summary, save_results
-from aiconfigurator.cli.spica.cli_adapter import run_spica_thorough_default
 from aiconfigurator.cli.utils import merge_experiment_results_by_mode, process_experiment_result
 from aiconfigurator.generator.api import (
     add_generator_override_arguments,
@@ -24,12 +24,16 @@ from aiconfigurator.generator.api import (
 )
 from aiconfigurator.logging_utils import setup_logging
 from aiconfigurator.sdk import common, perf_database
+from aiconfigurator.sdk.config_builders import resolve_nextn_auto
 from aiconfigurator.sdk.errors import (
+    ExperimentOutcome,
     NoFeasibleConfigError,
     UnsupportedWideepConfigError,
     is_expected_cli_error,
 )
 from aiconfigurator.sdk.models import check_is_moe
+from aiconfigurator.sdk.operations.base import resolve_op_data_path
+from aiconfigurator.sdk.speculative import normalize_speculative_decoding
 from aiconfigurator.sdk.task_v2 import Task
 from aiconfigurator.sdk.utils import ListFlowDumper, get_model_config_from_model_path
 
@@ -137,11 +141,11 @@ def _build_common_cli_experiments_parser() -> argparse.ArgumentParser:
     common_parser.add_argument(
         "--deployment-target",
         type=str,
-        choices=["dynamo-j2", "dynamo-python", "llm-d-helm", "llm-d-kustomize"],
+        choices=["dynamo-j2", "dynamo-python", "llm-d-helm", "llm-d-kustomize", "fpm"],
         default="dynamo-j2",
-        help="Deployment target platform. Options: dynamo-j2 (default, Jinja2 templates), "
+        help="Deployment target platform. Options: dynamo-j2 (default, typed Dynamo manifests), "
         "dynamo-python (Dynamo Python config modifiers), llm-d-helm (llm-d Helm values), "
-        "llm-d-kustomize (llm-d Kustomize overlays).",
+        "llm-d-kustomize (llm-d Kustomize overlays), fpm (reusable resource Pod + run.sh).",
     )
     common_parser.add_argument(
         "--engine-step-backend",
@@ -152,6 +156,64 @@ def _build_common_cli_experiments_parser() -> argparse.ArgumentParser:
     )
     add_generator_override_arguments(common_parser)
     return common_parser
+
+
+def _parse_nextn(value: str) -> int | str:
+    """argparse type for --nextn: a non-negative integer draft length, or 'auto'
+    to use the checkpoint's num_nextn_predict_layers."""
+    if value.strip().lower() == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--nextn must be a non-negative integer or 'auto', got {value!r}") from None
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"--nextn must be >= 0 or 'auto', got {parsed}")
+    return parsed
+
+
+def _resolve_and_validate_nextn(args) -> None:
+    """Fail fast on inconsistent MTP input; resolve --nextn auto to the checkpoint depth.
+
+    Mutates ``args.nextn`` in place so everything downstream sees a plain int.
+    """
+    if args.nextn == "auto":
+        try:
+            resolved = resolve_nextn_auto(args.model_path)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if resolved > 0:
+            logger.info(
+                "--nextn auto: modeling MTP with nextn=%d from the checkpoint's num_nextn_predict_layers.",
+                resolved,
+            )
+        else:
+            logger.info(
+                "--nextn auto: checkpoint ships no MTP layers (num_nextn_predict_layers absent or 0); "
+                "MTP stays disabled."
+            )
+        try:
+            resolved, args.nextn_accepted = normalize_speculative_decoding(resolved, args.nextn_accepted)
+        except ValueError as exc:
+            raise SystemExit(
+                f"--nextn auto resolved to nextn={resolved} from the checkpoint's num_nextn_predict_layers: {exc}"
+            ) from exc
+        args.nextn = resolved
+        return
+    try:
+        args.nextn, args.nextn_accepted = normalize_speculative_decoding(args.nextn, args.nextn_accepted)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _positive_float(value: str) -> float:
+    """Argparse type for positive finite floats (load targets, SLA thresholds)."""
+    import math
+
+    f = float(value)
+    if not (math.isfinite(f) and f > 0):
+        raise argparse.ArgumentTypeError(f"must be a positive finite number, got {value!r}")
+    return f
 
 
 def _validate_model_path(model_path: str) -> str:
@@ -193,15 +255,36 @@ def _add_default_mode_arguments(parser):
         "--model",
         dest="model_path",
         type=_validate_model_path,
-        default=None,
+        required=True,
         help="Model path: HuggingFace model path (e.g., 'Qwen/Qwen3-32B') or "
         "local path to directory containing config.json.",
     )
-    parser.add_argument("--total-gpus", type=int, default=None, help="Total GPUs for deployment.")
+    parser.add_argument(
+        "--total-gpus",
+        type=int,
+        default=None,
+        help="Total GPUs for deployment. "
+        "Omit and provide --target-request-rate or --target-concurrency to find minimum GPUs.",
+    )
+    load_group = parser.add_mutually_exclusive_group()
+    load_group.add_argument(
+        "--target-request-rate",
+        type=_positive_float,
+        default=None,
+        help="Target system request rate in req/s. When provided without --total-gpus, "
+        "finds the minimum GPU count (recommend mode).",
+    )
+    load_group.add_argument(
+        "--target-concurrency",
+        type=_positive_float,
+        default=None,
+        help="Target number of concurrent users. When provided without --total-gpus, "
+        "finds the minimum GPU count (recommend mode).",
+    )
     parser.add_argument(
         "--system",
         type=str,
-        default=None,
+        required=True,
         help=(
             "System name (GPU type). Example: "
             "h200_sxm,h100_sxm,h100_pcie,b200_sxm,b300_sxm,gb200,a100_sxm,a100_pcie,l40s,l4,a30,gb300."
@@ -272,6 +355,12 @@ def _add_default_mode_arguments(parser):
         "--num-images", type=int, default=1, help="Number of images per request for vision-language models. Default: 1."
     )
     parser.add_argument(
+        "--disable-encoder-dp",
+        action="store_true",
+        help="Model the vision encoder as TP-sharded instead of the default data-parallel "
+        "(vLLM mm_encoder_tp_mode='data' / SGLang --mm-enable-dp-encoder semantics).",
+    )
+    parser.add_argument(
         "--ttft",
         type=float,
         default=2000.0,
@@ -302,24 +391,6 @@ def _add_default_mode_arguments(parser):
         help="Optional end-to-end request latency target (ms). Enables request-latency optimization mode.",
     )
     parser.add_argument(
-        "--thorough-sweep",
-        action="store_true",
-        default=False,
-        help=(
-            "Experimental: use Spica's replay-backed thorough sweeper instead of the legacy AIC Pareto sweep. "
-            "Without --thorough-config, CLI inputs are converted to a Spica SmartSearchConfig."
-        ),
-    )
-    parser.add_argument(
-        "--thorough-config",
-        type=str,
-        default=None,
-        help=(
-            "Experimental: path to a native Spica SmartSearchConfig YAML file. Implies --thorough-sweep and "
-            "lets the file define the Spica search space, workload, goal, and sweep controls."
-        ),
-    )
-    parser.add_argument(
         "--inclusive-tpot",
         action="store_true",
         default=False,
@@ -331,20 +402,21 @@ def _add_default_mode_arguments(parser):
     parser.add_argument("--prefix", type=int, default=0, help="Prefix cache length. Default to 0.")
     parser.add_argument(
         "--nextn",
-        type=int,
+        type=_parse_nextn,
         default=0,
-        help="Number of draft tokens for MTP (Multi-Token Prediction) speculative decoding. "
-        "When set > 0, enables speculative decoding in the configuration search. "
-        "Requires the model to support MTP. Default: 0 (disabled).",
+        help="MTP (Multi-Token Prediction) draft length, or 'auto' to use the checkpoint's "
+        "num_nextn_predict_layers (absent/0 keeps MTP disabled). When the depth is > 0, enables "
+        "speculative decoding in the configuration search and requires --nextn-accepted. "
+        "Default: 0 (disabled); MTP is never enabled implicitly when the flag is omitted.",
     )
     parser.add_argument(
-        "--nextn-accept-rates",
-        type=str,
-        default="0.85,0.3,0,0,0",
-        help="Comma-separated acceptance rates for MTP draft tokens (5 values). "
-        "Each value is the acceptance probability of the i-th draft token; only the first "
-        "--nextn values are used. Example: '0.85,0.3,0,0,0' means the 1st draft token has "
-        "85%% acceptance, 2nd has 30%%, rest unused. Default: '0.85,0.3,0,0,0'.",
+        "--nextn-accepted",
+        type=float,
+        default=None,
+        help="Average accepted draft tokens per decode step (0 <= nextn_accepted <= nextn). "
+        "Required when --nextn resolves to > 0; there is no built-in acceptance "
+        "assumption — use a measured value from your deployment (e.g. the engine's "
+        "reported average acceptance length minus 1).",
     )
     parser.add_argument(
         "--enable-chunked-prefill",
@@ -375,6 +447,174 @@ def _add_default_mode_arguments(parser):
         help="Enable Wide Expert Parallelism (WideEP) for MoE models. "
         "When set, MoE models use EP-only parallelism with deepep_moe backend. "
         "Applies to both DeepSeek and Qwen3-235B on SGLang.",
+    )
+    parser.add_argument(
+        "--moe-backend",
+        type=str,
+        choices=["deepep_moe", "megamoe"],
+        default=None,
+        help="Explicit SGLang MoE backend. Use 'megamoe' to model DeepSeek-V4 MegaMoE on Blackwell.",
+    )
+
+
+def _add_recommend_mode_arguments(parser):
+    parser.add_argument(
+        "--model-path",
+        "--model",
+        dest="model_path",
+        type=_validate_model_path,
+        default=None,
+        help="Model path: HuggingFace model path (e.g., 'Qwen/Qwen3-32B') or "
+        "local path to directory containing config.json.",
+    )
+    load_group = parser.add_mutually_exclusive_group(required=True)
+    load_group.add_argument(
+        "--target-request-rate",
+        type=_positive_float,
+        default=None,
+        help="Target system request rate in req/s. Find minimum GPUs to serve this rate.",
+    )
+    load_group.add_argument(
+        "--target-concurrency",
+        type=_positive_float,
+        default=None,
+        help="Target number of concurrent users. Find minimum GPUs to serve this concurrency.",
+    )
+    parser.add_argument(
+        "--system",
+        type=str,
+        default=None,
+        help=(
+            "System name (GPU type). Example: "
+            "h200_sxm,h100_sxm,h100_pcie,b200_sxm,b300_sxm,gb200,a100_sxm,a100_pcie,l40s,l4,a30,gb300."
+        ),
+    )
+    parser.add_argument(
+        "--decode-system",
+        type=str,
+        default=None,
+        help="System name for disagg decode workers. Defaults to --system if omitted.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=[backend.value for backend in common.BackendName] + ["auto"],
+        type=str,
+        default=common.BackendName.trtllm.value,
+        help="Backend name. Use a specific backend (trtllm, vllm, sglang) or 'auto' to sweep "
+        "across all supported backends for the given system and compare results side by side. "
+        "Default: trtllm.",
+    )
+    parser.add_argument(
+        "--perf-db-version",
+        "--backend-version",
+        dest="backend_version",
+        type=str,
+        default=None,
+        help="[expert] Performance-database version used for the simulation/search "
+        "(search fidelity). Default: latest measured version. Alias: --backend-version.",
+    )
+    parser.add_argument(
+        "--database-mode",
+        choices=[mode.name for mode in common.DatabaseMode if mode != common.DatabaseMode.SOL_FULL],
+        type=str,
+        default=common.DatabaseMode.HYBRID.name,
+        help="Database mode for performance estimation. "
+        "HYBRID (default for recommend): extends SILICON with SOL+empirical estimates — "
+        "produces results even for frontier/new models without full silicon data. "
+        "SILICON: silicon-collected data only; results are fully reproducible. "
+        "EMPIRICAL: SOL+empirical factor only. SOL: theoretical Speed-of-Light only.",
+    )
+    parser.add_argument(
+        "--transfer-policy",
+        type=str,
+        default=None,
+        help="Fine-grained HYBRID/EMPIRICAL transfer control. "
+        "A preset (off|conservative|balanced|aggressive) or comma-separated kinds. "
+        "Default: all kinds enabled. Ignored in SILICON mode.",
+    )
+    parser.add_argument("--isl", type=int, default=4000, help="Input sequence length. Default: 4000.")
+    parser.add_argument("--osl", type=int, default=1000, help="Output sequence length. Default: 1000.")
+    parser.add_argument(
+        "--image-height",
+        type=int,
+        default=0,
+        help="Image height in pixels for vision-language models. Default: 0 (disabled).",
+    )
+    parser.add_argument(
+        "--image-width",
+        type=int,
+        default=0,
+        help="Image width in pixels for vision-language models. Default: 0 (disabled).",
+    )
+    parser.add_argument(
+        "--num-images", type=int, default=1, help="Number of images per request for vision-language models. Default: 1."
+    )
+    parser.add_argument(
+        "--ttft",
+        type=float,
+        default=2000.0,
+        help="Time to first token SLA target in ms. (Default: 2000)",
+    )
+    parser.add_argument(
+        "--tpot",
+        type=float,
+        default=30.0,
+        help="Time per output token SLA target in ms. (Default: 30)",
+    )
+    parser.add_argument(
+        "--strict-sla",
+        action="store_true",
+        default=False,
+        help="Filter the Pareto frontier and best configs to only SLA-compliant data points.",
+    )
+    parser.add_argument(
+        "--request-latency",
+        type=float,
+        default=None,
+        help="Optional end-to-end request latency target (ms). Enables request-latency optimization mode.",
+    )
+    parser.add_argument("--prefix", type=int, default=0, help="Prefix cache length. Default to 0.")
+    parser.add_argument(
+        "--nextn",
+        type=_parse_nextn,
+        default=0,
+        help="MTP (Multi-Token Prediction) draft length, or 'auto' to use the checkpoint's "
+        "num_nextn_predict_layers (absent/0 keeps MTP disabled). When the depth is > 0, enables "
+        "speculative decoding in the configuration search and requires --nextn-accepted. "
+        "Default: 0 (disabled); MTP is never enabled implicitly when the flag is omitted.",
+    )
+    parser.add_argument(
+        "--nextn-accepted",
+        type=float,
+        default=None,
+        help="Average accepted draft tokens per decode step (0 <= nextn_accepted <= nextn). "
+        "Required when --nextn resolves to > 0; there is no built-in acceptance "
+        "assumption — use a measured value from your deployment (e.g. the engine's "
+        "reported average acceptance length minus 1).",
+    )
+    parser.add_argument(
+        "--enable-chunked-prefill",
+        action="store_true",
+        default=False,
+        help="Enable chunked prefill for finer-grained context token sweep during optimization.",
+    )
+    parser.add_argument(
+        "--free-gpu-memory-fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of free GPU memory allocated for KV cache (default: 1.0).",
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=None,
+        help="TRT-LLM --max_seq_len setting (default: isl + osl).",
+    )
+    parser.add_argument(
+        "--enable-wideep",
+        action="store_true",
+        default=False,
+        help="Enable Wide Expert Parallelism (WideEP) for MoE models.",
     )
     parser.add_argument(
         "--moe-backend",
@@ -507,6 +747,12 @@ def _add_estimate_mode_arguments(parser):
     )
     parser.add_argument(
         "--num-images", type=int, default=1, help="Number of images per request for vision-language models. Default: 1."
+    )
+    parser.add_argument(
+        "--disable-encoder-dp",
+        action="store_true",
+        help="Model the vision encoder as TP-sharded instead of the default data-parallel "
+        "(vLLM mm_encoder_tp_mode='data' / SGLang --mm-enable-dp-encoder semantics).",
     )
     parser.add_argument(
         "--batch-size",
@@ -835,19 +1081,21 @@ def _add_estimate_mode_arguments(parser):
     )
     parser.add_argument(
         "--nextn",
-        type=int,
+        type=_parse_nextn,
         default=0,
-        help="(common) Number of MTP/speculative draft tokens. Default: 0 (disabled). "
-        "Applied to agg, disagg, and all static modes. "
-        "Note: unlike `cli default`, `cli estimate` does NOT auto-set nextn=1 for "
-        "DeepSeek/Qwen3.5 — pass --nextn 1 explicitly when you want MTP.",
+        help="(common) MTP draft length (compute cost side), or 'auto' to use the checkpoint's "
+        "num_nextn_predict_layers. Default: 0 (disabled); MTP is never enabled implicitly. "
+        "Applied to agg, disagg, and all static modes. Requires --nextn-accepted when the "
+        "resolved depth is > 0.",
     )
     parser.add_argument(
-        "--nextn-accept-rates",
-        type=str,
-        default="0.85,0.3,0,0,0",
-        help="(common) Comma-separated acceptance rates for the MTP draft tokens "
-        "(only the first --nextn are used). Default: '0.85,0.3,0,0,0'.",
+        "--nextn-accepted",
+        type=float,
+        default=None,
+        help="(common) Average accepted draft tokens per decode step "
+        "(0 <= nextn_accepted <= nextn). Required when --nextn resolves to > 0; "
+        "there is no built-in acceptance assumption — use a measured value from "
+        "your deployment.",
     )
     parser.add_argument(
         "--stride",
@@ -930,16 +1178,6 @@ aiconfigurator cli default --model Qwen/Qwen3-32B-FP8 \\
     --perf-db-version 1.2.0rc5 \\
     --config-template-version 1.2.0rc6 \\
     --save-dir results
-# Install the Spica thorough sweeper with pip install 'aiconfigurator[spica]'
-# Run a Spica thorough sweep from normal default CLI inputs
-aiconfigurator cli default --model Qwen/Qwen3-32B-FP8 \\
-    --backend trtllm \\
-    --total-gpus 32 --system h200_sxm \\
-    --isl 4000 --osl 1000 \\
-    --thorough-sweep
-
-# Run a Spica thorough sweep from a native SmartSearchConfig YAML
-aiconfigurator cli default --thorough-config spica_smart_sweep.yaml
 """
 
 
@@ -1011,8 +1249,23 @@ def configure_parser(parser):
     )
     _add_support_mode_arguments(support_parser)
 
+    recommend_parser = subparsers.add_parser(
+        "recommend",
+        parents=[common_cli_parser, common_cli_experiments_parser],
+        help="Find minimum GPUs to meet a performance target.",
+        description=(
+            "Given a model, system, workload (ISL/OSL), SLA targets (TTFT/TPOT), "
+            "and a load target (request rate or concurrency), find the minimum "
+            "number of GPUs needed. Designed as a procurement sizing tool — "
+            "the output is unconstrained."
+        ),
+    )
+    _add_recommend_mode_arguments(recommend_parser)
 
-def _get_backend_data_path(system_name: str, backend_name: str, backend_version: str) -> str | None:
+
+def _get_system_data_root(system_name: str) -> str | None:
+    """Resolve a system's perf-data root (the dir holding either
+    <family>/<backend>/<version> or legacy <backend>/<version> subtrees)."""
     for systems_root in perf_database.get_systems_paths():
         system_yaml = os.path.join(systems_root, f"{system_name}.yaml")
         if not os.path.isfile(system_yaml):
@@ -1022,8 +1275,17 @@ def _get_backend_data_path(system_name: str, backend_name: str, backend_version:
         data_dir = system_spec.get("data_dir")
         if not data_dir:
             return None
-        return os.path.join(systems_root, data_dir, backend_name, backend_version)
+        return os.path.join(systems_root, data_dir)
     return None
+
+
+def _get_backend_data_path(system_name: str, backend_name: str, backend_version: str, op_filename: str) -> str | None:
+    """Resolve one perf-data file's on-disk path for (system, backend, version),
+    across both the family-first and legacy tree layouts (see resolve_op_data_path)."""
+    system_data_root = _get_system_data_root(system_name)
+    if system_data_root is None:
+        return None
+    return resolve_op_data_path(system_data_root, backend_name, backend_version, op_filename)
 
 
 _SGLANG_DEEPEP_REQUIRED_FILES = (
@@ -1061,19 +1323,15 @@ def _sglang_deepep_perf_data_skip_reason(
             missing_versions.append(f"{system_to_check}/{common.BackendName.sglang.value}")
             continue
 
-        data_path = _get_backend_data_path(system_to_check, common.BackendName.sglang.value, resolved_version)
-        if data_path is None:
-            missing_paths.extend(
-                f"{system_to_check}/{common.BackendName.sglang.value}/{resolved_version}/{filename}"
-                for filename in _SGLANG_DEEPEP_REQUIRED_FILES
+        for filename in _SGLANG_DEEPEP_REQUIRED_FILES:
+            resolved_path = _get_backend_data_path(
+                system_to_check, common.BackendName.sglang.value, resolved_version, filename
             )
-            continue
-
-        missing_paths.extend(
-            os.path.join(data_path, filename)
-            for filename in _SGLANG_DEEPEP_REQUIRED_FILES
-            if not os.path.isfile(os.path.join(data_path, filename))
-        )
+            if resolved_path is None or not os.path.isfile(resolved_path):
+                missing_paths.append(
+                    resolved_path
+                    or f"{system_to_check}/{common.BackendName.sglang.value}/{resolved_version}/{filename}"
+                )
 
     if missing_versions:
         return "no database version available for " + ", ".join(missing_versions)
@@ -1121,16 +1379,24 @@ def _ensure_backend_version_available(
         backend_name,
         backend_version,
     )
-    data_path = _get_backend_data_path(system_name, backend_name, backend_version)
-    if data_path:
-        logger.error("Searched: %s", data_path)
+    system_data_root = _get_system_data_root(system_name)
+    if system_data_root:
+        logger.error(
+            "Searched: %s (backend=%s, version=%s; both family-first <family>/<backend>/<version> "
+            "and legacy <backend>/<version> layouts)",
+            system_data_root,
+            backend_name,
+            backend_version,
+        )
     logger.error("Configured systems paths: %s", systems_paths_display)
     if versions:
         logger.error("Available versions: %s", ", ".join(versions))
         logger.error(
             "Fix: switch --backend-version to one of the available versions, "
             "remove --backend-version to use latest, "
-            "or add a declared version directory with %s when this version intentionally reuses shared-layer data.",
+            "or add a declared version directory with %s (legacy: %s) when this version "
+            "intentionally reuses shared-layer data.",
+            perf_database.REUSE_YAML_MARKER,
             perf_database.SHARED_LAYER_REUSE_MARKER,
         )
     else:
@@ -1161,12 +1427,13 @@ def build_default_tasks(
     image_height: int = 0,
     image_width: int = 0,
     num_images: int = 1,
+    enable_encoder_dp: bool = True,
     ttft: float = 2000.0,
     tpot: float = 30.0,
     request_latency: float | None = None,
     prefix: int = 0,
-    nextn: int = 0,
-    nextn_accept_rates: list[float] | None = None,
+    nextn: int | str = 0,
+    nextn_accepted: float | None = None,
     enable_chunked_prefill: bool = False,
     free_gpu_memory_fraction: float | None = None,
     max_seq_len: int | None = None,
@@ -1191,8 +1458,12 @@ def build_default_tasks(
         tpot: Time per output token target in ms.
         request_latency: Optional end-to-end request latency target (ms).
         prefix: Prefix cache length.
-        nextn: Number of draft tokens for MTP speculative decoding.
-        nextn_accept_rates: Acceptance rates for MTP draft tokens.
+        nextn: MTP draft length, or ``"auto"`` to use the checkpoint's
+            ``num_nextn_predict_layers`` (absent/0 keeps MTP disabled).
+            Default 0 (disabled); never enabled implicitly.
+        nextn_accepted: Average accepted draft tokens per decode step
+            (0 <= nextn_accepted <= nextn). Required when the draft depth
+            resolves to > 0; never inferred.
         enable_chunked_prefill: Whether to enable chunked prefill for finer context token sweep.
         enable_wideep: Whether to enable Wide Expert Parallelism (WideEP) for MoE models.
         moe_backend: Explicit SGLang MoE backend override.
@@ -1203,7 +1474,6 @@ def build_default_tasks(
         (agg_trtllm, agg_vllm, agg_sglang, disagg_trtllm, disagg_vllm, disagg_sglang).
         Otherwise returns 2 configs ('agg' and 'disagg').
     """
-    nextn_accept_rates = nextn_accept_rates or [0.85, 0.3, 0.0, 0.0, 0.0]
     decode_system = decode_system or system
     # Expand "auto" backend to all available backends
     backends_to_sweep = [b.value for b in common.BackendName] if backend == "auto" else [backend]
@@ -1317,19 +1587,21 @@ def build_default_tasks(
         "max_seq_len": max_seq_len,
         "engine_step_backend": engine_step_backend,
     }
-    if nextn and nextn > 0:
+    if nextn == "auto" or (isinstance(nextn, int) and nextn > 0):
         global_kwargs["nextn"] = nextn
-        global_kwargs["nextn_accept_rates"] = nextn_accept_rates
+        global_kwargs["nextn_accepted"] = nextn_accepted
 
     if image_height or image_width or (num_images and num_images != 1):
         global_kwargs["image_height"] = image_height
         global_kwargs["image_width"] = image_width
         global_kwargs["num_images_per_request"] = num_images
+    if not enable_encoder_dp:
+        global_kwargs["enable_encoder_dp"] = False
 
     def _sglang_moe_backend_override(backend_name: str) -> str | None:
         if backend_name != common.BackendName.sglang.value:
             return None
-        # Auto-set moe_backend for SGLang wideep to preserve existing UI parity.
+        # Auto-set the DeepEP MoE runner for SGLang WideEP unless explicitly overridden.
         return moe_backend or ("deepep_moe" if enable_wideep else None)
 
     def _make_agg(backend_name: str, moe_backend_value: str | None) -> Task:
@@ -1546,7 +1818,15 @@ def _execute_tasks(
     max_total_gpus: int | None = None,
     strict_sla: bool = False,
     inclusive_tpot: bool = False,
-) -> tuple[str, dict[str, pd.DataFrame], dict[str, pd.DataFrame], dict[str, float], dict[str, dict[str, float]]]:
+    parallel_experiments: bool = False,
+) -> tuple[
+    str,
+    dict[str, pd.DataFrame],
+    dict[str, pd.DataFrame],
+    dict[str, float],
+    dict[str, dict[str, float]],
+    dict[str, ExperimentOutcome],
+]:
     """
     Execute task configs and return the chosen experiment, best configs, results, best
     throughputs, and estimated latencies.
@@ -1576,48 +1856,65 @@ def _execute_tasks(
               extracted from the rank-1 config.
     """
     results: dict[str, dict[str, pd.DataFrame]] = {}
-    failure_messages: list[str] = []
+    outcomes: dict[str, ExperimentOutcome] = {}
     start_time = time.time()
-    # TODO, can run in parallel
-    for exp_name, task in tasks.items():
+
+    def _run_one(exp_name: str, task) -> tuple[str, dict | None, ExperimentOutcome]:
+        """Run a single experiment and return (name, result_or_None, outcome)."""
         try:
             logger.info("Starting experiment: %s", exp_name)
             logger.debug("Task config: \n%s", task.to_yaml())
             pareto_df = task.run()
-            task_result = {"pareto_df": pareto_df}
             if pareto_df is not None and not pareto_df.empty:
-                results[exp_name] = task_result
                 logger.info("Experiment %s completed with %d results.", exp_name, len(pareto_df))
-            else:
-                db_mode = getattr(task, "database_mode", None)
-                hybrid_hint = (
-                    " For frontier/new models without silicon data, try --database-mode HYBRID."
-                    if db_mode == common.DatabaseMode.SILICON.name
-                    else ""
-                )
-                msg = (
-                    f"Experiment {exp_name} returned no results. Possible causes: "
-                    "(1) TTFT/TPOT constraints are too tight — try relaxing --ttft or --tpot; "
-                    "(2) the model does not fit on the available GPUs — try increasing --total-gpus; "
-                    f"(3) no perf data in the database for this configuration.{hybrid_hint}"
-                )
-                logger.warning(msg)
-                failure_messages.append(msg)
+                return exp_name, {"pareto_df": pareto_df}, ExperimentOutcome(exp_name)
+            db_mode = getattr(task, "database_mode", None)
+            hybrid_hint = (
+                " For frontier/new models without silicon data, try --database-mode HYBRID."
+                if db_mode == common.DatabaseMode.SILICON.name
+                else ""
+            )
+            # Load-target runs (recommend / auto-recommend) manage the GPU budget
+            # internally, so --total-gpus advice would point at an ignored flag.
+            gpu_hint = (
+                "(2) the model does not fit — try a quantized model; "
+                if target_request_rate is not None or target_concurrency is not None
+                else "(2) the model does not fit — try a larger --total-gpus value or a quantized model; "
+            )
+            msg = (
+                f"Experiment {exp_name} returned no results. Possible causes: "
+                "(1) TTFT/TPOT constraints are too tight — try relaxing --ttft or --tpot; "
+                f"{gpu_hint}"
+                f"(3) no perf data in the database for this configuration.{hybrid_hint}"
+            )
+            logger.warning(msg)
+            return exp_name, None, ExperimentOutcome(exp_name)
         except NoFeasibleConfigError as exc:
             msg = f"Experiment {exp_name} found no SLA-feasible configuration: {exc}"
             logger.warning(msg)
-            failure_messages.append(msg)
+            return exp_name, None, ExperimentOutcome(exp_name, error=exc)
         except Exception as exc:
             if is_expected_cli_error(exc):
-                # Expected failure (no feasible config / OOM / KV-cache capacity,
-                # a per-op perf-data miss, or an unsupported quant/compatibility
-                # config): report cleanly. Keep the traceback at DEBUG for
-                # diagnosis via --log-level DEBUG.
                 logger.log(logging.ERROR, "Error running experiment %s: %s", exp_name, exc)
                 logger.debug("Traceback for experiment %s", exp_name, exc_info=True)
             else:
                 logger.exception("Error running experiment %s", exp_name)
-            failure_messages.append(f"Experiment {exp_name} failed: {exc}")
+            return exp_name, None, ExperimentOutcome(exp_name, error=exc)
+
+    if parallel_experiments and len(tasks) >= 2:
+        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+            futures = {pool.submit(_run_one, n, t): n for n, t in tasks.items()}
+            for future in as_completed(futures):
+                exp_name, task_result, outcome = future.result()
+                outcomes[exp_name] = outcome
+                if task_result is not None:
+                    results[exp_name] = task_result
+    else:
+        for exp_name, task in tasks.items():
+            exp_name, task_result, outcome = _run_one(exp_name, task)
+            outcomes[exp_name] = outcome
+            if task_result is not None:
+                results[exp_name] = task_result
 
     if len(results) < 1:
         first_config = next(iter(tasks.values()), None)
@@ -1630,9 +1927,10 @@ def _execute_tasks(
             )
         else:
             logger.error("No successful experiment runs to compare.")
-        for msg in failure_messages:
-            logger.error("  -> %s", msg)
-        raise SystemExit(1)
+        for outcome in outcomes.values():
+            if outcome.error is not None:
+                logger.error("  -> Experiment %s failed: %s", outcome.experiment, outcome.error)
+        return "none", {}, {}, {}, {}, outcomes
 
     best_configs: dict[str, pd.DataFrame] = {}
     best_throughputs: dict[str, float] = {}
@@ -1680,7 +1978,7 @@ def _execute_tasks(
     end_time = time.time()
     logger.info("All experiments completed in %.2f seconds", end_time - start_time)
 
-    return chosen_exp, best_configs, pareto_fronts, best_throughputs, best_latencies
+    return chosen_exp, best_configs, pareto_fronts, best_throughputs, best_latencies, outcomes
 
 
 def _run_generate_mode(args):
@@ -2003,15 +2301,7 @@ def _run_estimate_mode(args):
         args.batch_size,
     )
 
-    # Parse nextn accept rates (string form on CLI -> list of floats for API).
-    nextn_accept_rates = None
-    if args.nextn_accept_rates:
-        try:
-            nextn_accept_rates = [float(x) for x in args.nextn_accept_rates.split(",") if x.strip() != ""]
-        except ValueError as exc:
-            raise SystemExit(
-                f"Invalid --nextn-accept-rates {args.nextn_accept_rates!r}; expected comma-separated floats."
-            ) from exc
+    _resolve_and_validate_nextn(args)
 
     # Resolve --detail before running the estimate so time detail can compare
     # against a second SOL-mode result.
@@ -2035,6 +2325,7 @@ def _run_estimate_mode(args):
         image_height=args.image_height,
         image_width=args.image_width,
         num_images=args.num_images,
+        enable_encoder_dp=not args.disable_encoder_dp,
         batch_size=args.batch_size,
         ctx_tokens=args.ctx_tokens,
         tp_size=args.tp_size,
@@ -2052,7 +2343,7 @@ def _run_estimate_mode(args):
         engine_step_backend=args.engine_step_backend,
         prefix=args.prefix,
         nextn=args.nextn,
-        nextn_accept_rates=nextn_accept_rates,
+        nextn_accepted=args.nextn_accepted,
         stride=args.stride,
     )
 
@@ -2114,6 +2405,7 @@ def _run_estimate_mode(args):
     print(f"  OSL:              {result.osl}")
     if args.image_height > 0 and args.image_width > 0 and args.num_images > 0:
         print(f"  Images:           {args.num_images} x {args.image_height}x{args.image_width}")
+        print(f"  Encoder parallel: {'TP (weight-sharded)' if args.disable_encoder_dp else 'DP (data-parallel)'}")
 
     # ``--prefix`` and ``--nextn`` are common parameters applied to every
     # mode (agg / disagg / afd / static*), so surface them in the summary box
@@ -2121,7 +2413,7 @@ def _run_estimate_mode(args):
     if args.prefix:
         print(f"  Prefix:           {args.prefix}")
     if args.nextn:
-        print(f"  MTP nextn:        {args.nextn} (accept_rates={args.nextn_accept_rates})")
+        print(f"  MTP nextn:        {args.nextn} (nextn_accepted={args.nextn_accepted})")
 
     if result.mode == "disagg":
         raw = result.raw
@@ -2222,7 +2514,12 @@ def _run_estimate_mode(args):
     encoder_latency = float(result.raw.get("encoder_latency", 0.0) or 0.0)
     if encoder_latency > 0.0:
         print(f"  Encoder lat.:     {encoder_latency:.3f} ms")
-    print(f"  Power (per GPU):  {result.power_w:.1f} W")
+    if result.power_w is None:
+        coverage = result.power_coverage
+        coverage_note = f" ({coverage:.1%} coverage)" if coverage is not None else ""
+        print(f"  Power (per GPU):  unavailable{coverage_note}")
+    else:
+        print(f"  Power (per GPU):  {result.power_w:.1f} W")
     print("-" * 60)
     print(f"  tokens/s:         {result.tokens_per_second:,.2f}")
     print(f"  tokens/s/gpu:     {result.tokens_per_second_per_gpu:,.2f}")
@@ -2283,6 +2580,73 @@ def _resolve_cli_log_level(args) -> int:
     return logging.INFO
 
 
+def _validate_fpm_sweep_tasks(args, tasks: dict[str, Task]) -> None:
+    """Reject task shapes that can only fail after an expensive FPM sweep."""
+    if getattr(args, "deployment_target", "dynamo-j2") != "fpm":
+        return
+
+    unsupported: list[str] = []
+    for name, task in tasks.items():
+        serving_mode = getattr(task, "serving_mode", None)
+        backend = getattr(task, "primary_backend_name", None)
+        if serving_mode != "agg" or backend != common.BackendName.vllm.value:
+            unsupported.append(f"{name} ({serving_mode or 'unknown'}/{backend or 'unknown'})")
+
+    if unsupported:
+        raise SystemExit(
+            "--deployment-target fpm supports only vLLM aggregated tasks; "
+            "unsupported task(s): " + ", ".join(unsupported)
+        )
+
+
+def _run_recommend(args) -> None:
+    """Run recommend mode: find minimum GPUs for a load target."""
+    from aiconfigurator.cli.api import cli_recommend
+    from aiconfigurator.sdk.errors import NoResultsError
+
+    logger.info(
+        "Finding minimum GPUs for %s on %s (backend=%s)",
+        args.model_path,
+        args.system,
+        args.backend,
+    )
+    try:
+        cli_recommend(
+            model_path=args.model_path,
+            system=args.system,
+            target_request_rate=getattr(args, "target_request_rate", None),
+            target_concurrency=getattr(args, "target_concurrency", None),
+            decode_system=args.decode_system,
+            backend=args.backend,
+            backend_version=args.backend_version,
+            database_mode=args.database_mode,
+            transfer_policy=args.transfer_policy,
+            isl=args.isl,
+            osl=args.osl,
+            image_height=args.image_height,
+            image_width=args.image_width,
+            num_images=args.num_images,
+            ttft=args.ttft,
+            tpot=args.tpot,
+            request_latency=args.request_latency,
+            prefix=args.prefix,
+            nextn=args.nextn,
+            nextn_accepted=args.nextn_accepted,
+            strict_sla=getattr(args, "strict_sla", False),
+            enable_chunked_prefill=args.enable_chunked_prefill,
+            free_gpu_memory_fraction=args.free_gpu_memory_fraction,
+            max_seq_len=args.max_seq_len,
+            enable_wideep=getattr(args, "enable_wideep", False),
+            moe_backend=getattr(args, "moe_backend", None),
+            top_n=args.top_n,
+            save_dir=args.save_dir,
+            engine_step_backend=args.engine_step_backend,
+        )
+    except NoResultsError as exc:
+        logger.debug("Recommend mode traceback", exc_info=True)
+        raise SystemExit(1) from exc
+
+
 def _validate_default_mode_inputs(args) -> None:
     """Validate default-mode args that are conditional on the selected sweeper."""
     if args.mode != "default":
@@ -2292,7 +2656,6 @@ def _validate_default_mode_inputs(args) -> None:
 
     required = {
         "model_path": "--model-path/--model",
-        "total_gpus": "--total-gpus",
         "system": "--system",
     }
     missing = [flag for attr, flag in required.items() if getattr(args, attr, None) is None]
@@ -2301,6 +2664,14 @@ def _validate_default_mode_inputs(args) -> None:
             "default mode requires "
             + ", ".join(missing)
             + " unless --thorough-config provides a native Spica SmartSearchConfig."
+        )
+    has_gpus = getattr(args, "total_gpus", None) is not None
+    has_load_target = (
+        getattr(args, "target_request_rate", None) is not None or getattr(args, "target_concurrency", None) is not None
+    )
+    if not has_gpus and not has_load_target:
+        raise SystemExit(
+            "default mode requires either --total-gpus or a load target (--target-request-rate / --target-concurrency)."
         )
 
 
@@ -2345,11 +2716,32 @@ def main(args):
             raise
         return
 
+    if args.mode == "recommend":
+        if not getattr(args, "model_path", None):
+            raise SystemExit("recommend mode requires --model-path")
+        if not getattr(args, "system", None):
+            raise SystemExit("recommend mode requires --system")
+        _resolve_and_validate_nextn(args)
+        _run_recommend(args)
+        return
+
     if args.mode == "default":
+        _resolve_and_validate_nextn(args)
         _validate_default_mode_inputs(args)
-        if getattr(args, "thorough_sweep", False) or getattr(args, "thorough_config", None):
-            run_spica_thorough_default(args)
+
+        # No --total-gpus but a load target means recommend mode
+        has_load_target = (
+            getattr(args, "target_request_rate", None) is not None
+            or getattr(args, "target_concurrency", None) is not None
+        )
+        if getattr(args, "total_gpus", None) is None and has_load_target:
+            _run_recommend(args)
             return
+        if has_load_target:
+            logger.warning(
+                "--target-request-rate/--target-concurrency are ignored in default mode when "
+                "--total-gpus is set. Omit --total-gpus to find the minimum GPUs for the load target."
+            )
 
         # Warn when SLA/workload parameters are implicitly defaulted
         _default_params = {"isl": 4000, "osl": 1000, "ttft": 2000.0, "tpot": 30.0}
@@ -2387,12 +2779,13 @@ def main(args):
             image_height=args.image_height,
             image_width=args.image_width,
             num_images=args.num_images,
+            enable_encoder_dp=not args.disable_encoder_dp,
             ttft=args.ttft,
             tpot=args.tpot,
             request_latency=args.request_latency,
             prefix=args.prefix,
             nextn=args.nextn,
-            nextn_accept_rates=[float(x) for x in args.nextn_accept_rates.split(",")],
+            nextn_accepted=args.nextn_accepted,
             enable_chunked_prefill=args.enable_chunked_prefill,
             free_gpu_memory_fraction=args.free_gpu_memory_fraction,
             max_seq_len=args.max_seq_len,
@@ -2415,17 +2808,21 @@ def main(args):
     else:
         raise SystemExit(f"Unsupported mode: {args.mode}")
 
+    _validate_fpm_sweep_tasks(args, tasks)
+
     execute_kwargs: dict = {}
     if getattr(args, "strict_sla", False):
         execute_kwargs["strict_sla"] = True
     if getattr(args, "inclusive_tpot", False):
         execute_kwargs["inclusive_tpot"] = True
-    _, best_configs, pareto_fronts, _, _ = _execute_tasks(
+    _, best_configs, pareto_fronts, _, _, _ = _execute_tasks(
         tasks,
         args.mode,
         top_n=args.top_n,
         **execute_kwargs,
     )
+    if not best_configs:
+        raise SystemExit(1)
 
     if args.save_dir:
         save_results(

@@ -26,6 +26,7 @@ from aiconfigurator.sdk.utils import enumerate_parallel_config
 from aiconfigurator.sdk.memory import estimate_kv_cache
 from aiconfigurator_core.sdk.perf_database import load_system_spec
 from aiconfigurator_core.sdk.common import SupportedSystems
+from aiconfigurator_core.sdk.utils import get_model_config_from_model_path
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +59,7 @@ def list_supported_models(
     )
 
 
-@app.post("/kv_cache_calc")
-@app.post("/memory_estimate")
+@app.post("/memory")
 def post_kv_cache_calc(
     model_path: str = Body("QWEN3_32B", description="model name"),
     system: str = Body(
@@ -91,15 +91,7 @@ def post_kv_cache_calc(
     naive_kv_reservation: float = Body(0.80),
     allow_naive_fallback: bool = Body(False),
     allow_hf_config_download: bool = Body(False),    
-    username: str = Body("default"),
-    password: str = Body("default"),
-):
-    if username[:6] == open(os.path.expanduser("~/aiconfigurator/username.txt"), "r").read()[:6] and \
-        password[:12] == open(os.path.expanduser("~/aiconfigurator/password.txt"), "r").read()[:12]:
-        pass
-    else:
-        raise Exception("Invalid username or password")
-    
+):   
     if backend_version is None:
         if backend == "vllm":
             backend_version = "0.22.0"
@@ -144,64 +136,6 @@ def post_kv_cache_calc(
 
     return cache_data
 
-
-@app.post("/gpu_sizer")
-def post_gpu_sizer(
-    system: str = Body(
-        "h200_sxm",
-        description="hardware name, h200_sxm, h100_sxm, h100_pcie, b200_sxm, gb200, a100_sxm, a100_pcie, l4, a30",
-    ),
-    # backend: str = Body("trtllm", description="backend name, trtllm, sglang, vllm"),
-    model_path: str = Body("QWEN3_32B", description="model name"),
-    isl: int = Body(4000, description="input sequence length"),
-    osl: int = Body(500, description="output sequence length"),
-    ttft: int = Body(600000, description="first token latency limit"),
-    tps_per_user: int = Body(0, description="tokens per second per user minimum"),
-    e2e: int = Body(600000000, description="end to end latency limit"),
-    batch_size: int = Body(1, description="number of simultaneous requests"),
-    model_agg_mode: str = Body("agg", description="model aggregation mode, agg, afd"),
-    username: str = Body("default"),
-    password: str = Body("default"),
-    target_concurrency: int = Body(0),
-    max_gpu_count: int=Body(128),
-    database_mode: str = Body("HYBRID"),
-    backend_name: str = Body("vllm"),
-    backend_version: str | None = Body(None),
-):
-    if username[:6] == open(os.path.expanduser("~/aiconfigurator/username.txt"), "r").read()[:6] and \
-        password[:12] == open(os.path.expanduser("~/aiconfigurator/password.txt"), "r").read()[:12]:
-        pass
-    else:
-        raise Exception("Invalid username or password")
-
-    if backend_version is None:
-        if backend_name == "vllm":
-            backend_version = "0.22.0"
-        elif backend_name == "sglang":
-            backend_version = "0.5.10"
-        elif backend_name == "trtllm":
-            backend_version = "1.3.0rc10"
-
-    try:
-        print()
-        result_dict = gpu_sizer(model_path=model_path,
-                                isl=isl,
-                                osl=osl,
-                                batch_size=batch_size,
-                                tps_per_user=tps_per_user,
-                                max_ttft=ttft,
-                                max_e2e_latency=e2e,
-                                model_agg_mode=model_agg_mode,
-                                system=system,
-                                max_gpu_count=max_gpu_count,
-                                database_mode=database_mode,
-                                backend_name=backend_name,
-                                backend_version=backend_version,
-                                target_concurrency=target_concurrency)
-    except Exception as e:
-        print(e)
-        result_dict = {"error": str(e)}
-    return result_dict
 
 @app.post("/recommend")
 def post_recommend(
@@ -386,48 +320,26 @@ def post_sla(
 
 @app.post("/get_hardware")
 def get_hardware(
-    system: str = Body("h200_sxm", description="hardware name, h200_sxm, h100_sxm, h100_pcie, b200_sxm, gb200, a100_sxm, a100_pcie, l4, a30"),
-    username: str = Body("default"),
-    password: str = Body("default"),
+    detailed: bool = Body(False, description="whether to return detailed hardware information"),
 ):
-    if username[:6] == open(os.path.expanduser("~/aiconfigurator/username.txt"), "r").read()[:6] and \
-        password[:12] == open(os.path.expanduser("~/aiconfigurator/password.txt"), "r").read()[:12]:
-        pass
-    else:
-        raise Exception("Invalid username or password")
-    data_dict = load_system_spec(system)
-    print(data_dict)
-    return data_dict['gpu']
-
-
-@app.post("/get_hardware_list")
-def get_hardware_list(
-    username: str = Body("default"),
-    password: str = Body("default"),
-):
-    if username[:6] == open(os.path.expanduser("~/aiconfigurator/username.txt"), "r").read()[:6] and \
-        password[:12] == open(os.path.expanduser("~/aiconfigurator/password.txt"), "r").read()[:12]:
-        pass
-    else:
-        raise Exception("Invalid username or password")
     gpu_list = SupportedSystems
-    print(gpu_list)
-    return gpu_list
-
-
-@app.post("/get_supported_models")
-def get_supported_models(
-    username: str = Body("default"),
-    password: str = Body("default"),
-):
-    if username[:6] == open(os.path.expanduser("~/aiconfigurator/username.txt"), "r").read()[:6] and \
-        password[:12] == open(os.path.expanduser("~/aiconfigurator/password.txt"), "r").read()[:12]:
-        pass
+    if detailed:
+        return gpu_list
     else:
-        raise Exception("Invalid username or password")
+        return [load_system_spec(gpu.name)['gpu'] for gpu in gpu_list]
+
+
+@app.get("/get_models")
+def get_model(
+    detailed: bool = Body(False, description="whether to return detailed model information"),
+):
     default_models = get_default_models()
-    print(default_models)
-    return default_models
+    if detailed:
+        return default_models
+    else:
+        return [get_model_config_from_model_path(model.name) for model in default_models]
+    model_config = get_model_config_from_model_path(model_path)
+    return model_config
 
 
 def parse(args):

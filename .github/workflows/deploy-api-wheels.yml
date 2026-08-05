@@ -81,7 +81,7 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      - name: Create or update GitHub Release
+      - name: Create versioned GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -89,10 +89,8 @@ jobs:
 
           # Delete existing release with same tag if present
           gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
-          git tag -d "$tag" 2>/dev/null || true
           gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" -X DELETE 2>/dev/null || true
 
-          # Create release
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --title "API wheels v${{ steps.version.outputs.version }} (${GITHUB_SHA:0:8})" \
@@ -103,7 +101,25 @@ jobs:
 
           Install:
           \`\`\`
-          pip install aiconfigurator-core aiconfigurator --find-links https://github.com/${GITHUB_REPOSITORY}/releases/expanded_assets/${tag}
+          pip install aiconfigurator-core aiconfigurator --find-links https://github.com/${GITHUB_REPOSITORY}/releases/expanded_assets/deploy-api-latest
           \`\`\`" \
+            --prerelease \
+            wheelhouse/*.whl
+
+      - name: Update latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Delete the previous "latest" release and re-create with current wheels
+          gh release delete deploy-api-latest --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/deploy-api-latest" -X DELETE 2>/dev/null || true
+
+          gh release create deploy-api-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "API wheels (latest)" \
+            --notes "Latest manylinux_2_28_x86_64 wheels from deploy/api branch.
+
+          Built from: ${{ steps.version.outputs.tag }}
+          Commit: ${GITHUB_SHA}" \
             --prerelease \
             wheelhouse/*.whl

@@ -8,7 +8,7 @@
 # wheels and publishes them as GitHub Release assets. Vercel's Python
 # runtime runs pip install during build.
 
---find-links https://github.com/openshift-psap/aiconfigurator/releases/expanded_assets/latest
+--find-links https://github.com/openshift-psap/aiconfigurator/releases/expanded_assets/deploy-api-latest
 
 aiconfigurator-core
 aiconfigurator

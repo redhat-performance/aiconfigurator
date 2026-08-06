@@ -19,7 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field, model_validator
 
-from aiconfigurator.cli.api import cli_recommend
+from aiconfigurator.cli.api import cli_recommend, _execute_and_wrap_result, _build_recommend_tasks
+from aiconfigurator.cli.main import build_default_tasks
 from aiconfigurator.sdk.common import get_default_models
 from aiconfigurator.sdk.memory import estimate_kv_cache
 from aiconfigurator_core.sdk.common import SupportedSystems
@@ -306,29 +307,69 @@ app.add_middleware(
 )
 
 
+def _recommend_quick(req: RecommendRequest):
+    """Fast agg-only, single-node, top-1 recommendation."""
+    spec = load_system_spec(req.system)
+    gpus_per_node = spec["node"]["num_gpus_per_node"]
+
+    base_tasks = build_default_tasks(
+        model_path=req.model_path,
+        total_gpus=gpus_per_node,
+        system=req.system,
+        backend=req.backend,
+        backend_version=req.backend_version,
+        database_mode=req.database_mode,
+        isl=req.isl,
+        osl=req.osl,
+        ttft=req.ttft,
+        tpot=req.tpot,
+        request_latency=req.request_latency,
+        prefix=req.prefix,
+    )
+    base_tasks = {k: v for k, v in base_tasks.items() if v.serving_mode == "agg"}
+
+    tasks = _build_recommend_tasks(base_tasks, gpus_per_node)
+    return _execute_and_wrap_result(
+        tasks,
+        mode="default",
+        top_n=1,
+        target_request_rate=req.target_request_rate,
+        target_concurrency=req.target_concurrency,
+    )
+
+
+def _recommend_full(req: RecommendRequest):
+    """Full recommendation across agg and disagg modes."""
+    return cli_recommend(
+        model_path=req.model_path,
+        system=req.system,
+        backend=req.backend,
+        backend_version=req.backend_version,
+        target_request_rate=req.target_request_rate,
+        target_concurrency=req.target_concurrency,
+        database_mode=req.database_mode,
+        isl=req.isl,
+        osl=req.osl,
+        ttft=req.ttft,
+        tpot=req.tpot,
+        request_latency=req.request_latency,
+        prefix=req.prefix,
+        top_n=req.top_n,
+    )
+
+
 @app.post("/recommend")
 def post_recommend(
     req: RecommendRequest,
     include: str | None = Query(default=None, examples=["config,memory"], description="Comma-separated extras: config, memory."),
+    mode: str | None = Query(default=None, examples=["quick"], description="Search mode: 'quick' for fast agg-only single-node top-1 result, or omit for full search across agg and disagg modes."),
 ):
     """Find optimal GPU configuration for a workload."""
     try:
-        result = cli_recommend(
-            model_path=req.model_path,
-            system=req.system,
-            backend=req.backend,
-            backend_version=req.backend_version,
-            target_request_rate=req.target_request_rate,
-            target_concurrency=req.target_concurrency,
-            database_mode=req.database_mode,
-            isl=req.isl,
-            osl=req.osl,
-            ttft=req.ttft,
-            tpot=req.tpot,
-            request_latency=req.request_latency,
-            prefix=req.prefix,
-            top_n=req.top_n,
-        )
+        if mode == "quick":
+            result = _recommend_quick(req)
+        else:
+            result = _recommend_full(req)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except AttributeError as e:
@@ -345,6 +386,8 @@ def post_recommend(
         raise HTTPException(status_code=500, detail=str(e))
 
     best = result.best_configs.get(result.chosen_exp)
+    chosen = result.chosen_exp
+
     if best is None or best.empty:
         raise HTTPException(status_code=422, detail="No configuration meets the specified requirements.")
 
@@ -361,7 +404,7 @@ def post_recommend(
             cfg.memory_breakdown = _build_memory_breakdown(req, cfg)
         configs.append(cfg)
 
-    return RecommendResponse(configs=configs, chosen_mode=result.chosen_exp)
+    return RecommendResponse(configs=configs, chosen_mode=chosen)
 
 
 @app.post("/memory", response_model=MemoryResponse)

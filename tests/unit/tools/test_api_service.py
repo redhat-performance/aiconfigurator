@@ -336,6 +336,70 @@ class TestRecommend:
         assert resp.json()["configs"][0]["memory_breakdown"] is None
 
 
+# ─── /recommend mode tests ────────────────────────────────────────────────────
+
+
+class TestRecommendMode:
+
+    @patch("tools.api_service.app.load_system_spec")
+    @patch("tools.api_service.app._execute_and_wrap_result")
+    @patch("tools.api_service.app._build_recommend_tasks")
+    @patch("tools.api_service.app.build_default_tasks")
+    def test_quick_mode_returns_single_config(self, mock_build, mock_reco_tasks, mock_execute, mock_spec):
+        mock_spec.return_value = MOCK_SYSTEM_SPEC
+        mock_build.return_value = {"agg_vllm": MagicMock(serving_mode="agg")}
+        mock_reco_tasks.return_value = {"agg_vllm": MagicMock()}
+        mock_execute.return_value = make_mock_cli_result()
+        resp = client.post("/recommend?mode=quick", json=VALID_RECOMMEND_BODY)
+        assert resp.status_code == 200
+        assert len(resp.json()["configs"]) == 1
+        call_kwargs = mock_execute.call_args
+        assert call_kwargs.kwargs.get("top_n") == 1
+
+    @patch("tools.api_service.app.load_system_spec")
+    @patch("tools.api_service.app._execute_and_wrap_result")
+    @patch("tools.api_service.app._build_recommend_tasks")
+    @patch("tools.api_service.app.build_default_tasks")
+    def test_quick_mode_filters_disagg_tasks(self, mock_build, mock_reco_tasks, mock_execute, mock_spec):
+        mock_spec.return_value = MOCK_SYSTEM_SPEC
+        mock_build.return_value = {
+            "agg_vllm": MagicMock(serving_mode="agg"),
+            "disagg_vllm": MagicMock(serving_mode="disagg"),
+        }
+        mock_reco_tasks.return_value = {"agg_vllm": MagicMock()}
+        mock_execute.return_value = make_mock_cli_result()
+        resp = client.post("/recommend?mode=quick", json=VALID_RECOMMEND_BODY)
+        assert resp.status_code == 200
+        built_tasks = mock_reco_tasks.call_args[0][0]
+        assert all("disagg" not in k for k in built_tasks)
+
+    @patch("tools.api_service.app.cli_recommend")
+    def test_default_mode_unchanged(self, mock_recommend):
+        mock_recommend.return_value = make_mock_cli_result()
+        resp = client.post("/recommend", json=VALID_RECOMMEND_BODY)
+        assert resp.status_code == 200
+        assert resp.json()["chosen_mode"] == "agg"
+
+    @patch("tools.api_service.app.estimate_kv_cache")
+    @patch("tools.api_service.app.load_system_spec")
+    @patch("tools.api_service.app._execute_and_wrap_result")
+    @patch("tools.api_service.app._build_recommend_tasks")
+    @patch("tools.api_service.app.build_default_tasks")
+    def test_quick_with_include_config_and_memory(self, mock_build, mock_reco_tasks, mock_execute, mock_spec, mock_kv):
+        mock_spec.return_value = MOCK_SYSTEM_SPEC
+        mock_build.return_value = {"agg_vllm": MagicMock(serving_mode="agg")}
+        mock_reco_tasks.return_value = {"agg_vllm": MagicMock()}
+        mock_execute.return_value = make_mock_cli_result()
+        mock_kv.return_value = MOCK_KV_CACHE_RESULT
+        resp = client.post("/recommend?mode=quick&include=config,memory", json=VALID_RECOMMEND_BODY)
+        assert resp.status_code == 200
+        cfg = resp.json()["configs"][0]
+        assert cfg["serving_config"] is not None
+        assert cfg["serving_config"]["tensor_parallel_size"] >= 1
+        assert cfg["memory_breakdown"] is not None
+        assert cfg["memory_breakdown"]["weights_bytes"] > 0
+
+
 # ─── /memory tests ───────────────────────────────────────────────────────────
 
 
@@ -366,10 +430,10 @@ class TestMemory:
 
     @patch("tools.api_service.app.estimate_kv_cache")
     def test_value_error_returns_422(self, mock_kv):
-        mock_kv.side_effect = ValueError("unsupported model")
+        mock_kv.side_effect = ValueError("unsupported model/backend/GPU for KV-cache estimation")
         resp = client.post("/memory", json=VALID_MEMORY_BODY)
         assert resp.status_code == 422
-        assert "unsupported model" in resp.json()["detail"]
+        assert "No performance data" in resp.json()["detail"]
 
     @patch("tools.api_service.app.estimate_kv_cache")
     def test_unexpected_error_returns_500(self, mock_kv):

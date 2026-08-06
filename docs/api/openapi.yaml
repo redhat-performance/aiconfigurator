@@ -53,6 +53,17 @@ paths:
           schema:
             type: string
             example: "config,memory"
+        - name: mode
+          in: query
+          required: false
+          description: |
+            Search mode. Use 'quick' for a fast agg-only, single-node, top-1
+            result (~1s warm). Omit for a full search across aggregated and
+            disaggregated serving modes.
+          schema:
+            type: string
+            enum: [quick]
+            example: "quick"
       requestBody:
         required: true
         content:

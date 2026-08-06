@@ -148,6 +148,13 @@ pub struct MlaModuleOp {
     pub kv_cache_dtype: KvCacheQuantMode,
     pub fmha_quant_mode: FmhaQuantMode,
     pub gemm_quant_mode: GemmQuantMode,
+    /// Model-native identity for the `[native][local]` module table (#1458).
+    /// `None` = legacy single-native resolution; `serde(default)` covers JSON
+    /// specs predating the field. NO `skip_serializing_if`: bincode decodes
+    /// positionally, so an omitted field would desync every op decoded after
+    /// it — the layout change is gated by the ENGINE_SPEC_SCHEMA_VERSION bump.
+    #[serde(default)]
+    pub native_num_heads: Option<u32>,
 }
 
 impl MlaModuleOp {
@@ -165,6 +172,7 @@ impl MlaModuleOp {
             kv_cache_dtype,
             fmha_quant_mode,
             gemm_quant_mode,
+            native_num_heads: None,
         }
     }
 
@@ -184,6 +192,7 @@ impl MlaModuleOp {
             self.kv_cache_dtype,
             self.fmha_quant_mode,
             self.gemm_quant_mode,
+            self.native_num_heads,
         )?;
         Ok(PerformanceResult::new(latency, source)
             .clamp_non_negative()
@@ -205,6 +214,7 @@ impl MlaModuleOp {
             self.num_heads,
             self.kv_cache_dtype,
             self.gemm_quant_mode,
+            self.native_num_heads,
         )?;
         Ok(PerformanceResult::new(latency, source)
             .clamp_non_negative()
@@ -386,6 +396,36 @@ fn generation_mla_empirical(
     Ok(latency)
 }
 
+/// Head slice the BMM table queries run against, with the linear scale to
+/// apply to that slice's result. Exact-head-first: return the requested
+/// head count at scale 1.0 when the table has rows for it, else the next
+/// power of two — the DeepSeek grid every dataset carries (exact rows for
+/// non-pow2 shards, e.g. Kimi-K3's 96/48/24/12, exist only where
+/// re-collected). A missing table/slice also resolves to the pow2 fallback
+/// so downstream misses keep the legacy error shape. Python twin:
+/// `MLABmm._resolve_slice_heads`.
+fn resolve_bmm_slice_heads(
+    db: &PerfDatabase,
+    num_heads: u32,
+    quant: GemmQuantMode,
+    is_pre: bool,
+) -> Result<(u32, f64), AicError> {
+    let pow2 = num_heads.next_power_of_two();
+    if pow2 == num_heads {
+        return Ok((num_heads, 1.0));
+    }
+    let has_exact = match db.mla.bmm_selected_quant(quant) {
+        Ok(selected) => db.mla.bmm_has_heads(selected, is_pre, num_heads)?,
+        Err(err) if err.is_missing_perf_data() => false,
+        Err(err) => return Err(err),
+    };
+    if has_exact {
+        Ok((num_heads, 1.0))
+    } else {
+        Ok((pow2, f64::from(num_heads) / f64::from(pow2)))
+    }
+}
+
 /// MLA BMM (pre/post) latency under the database's query mode.
 fn query_mla_bmm_table(
     db: &PerfDatabase,
@@ -394,20 +434,30 @@ fn query_mla_bmm_table(
     quant: GemmQuantMode,
     is_pre: bool,
 ) -> Result<(f64, Source), AicError> {
+    // Exact-head-first routing with a data-presence fallback: query the
+    // exact head slice at scale 1.0 when it has rows, otherwise the
+    // next-pow2 DeepSeek slice scaled linearly by the head ratio (BMM is
+    // per-head batched; reproduces the legacy count-ratio modeling for
+    // Kimi-K3's 96-family shards). Python twin:
+    // `MLABmm._query_mla_bmm_table`.
+    let (num_heads, head_scale) = resolve_bmm_slice_heads(db, num_heads, quant, is_pre)?;
     match db.database_mode {
         DatabaseMode::Empirical => Ok((
-            mla_bmm_empirical(db, num_tokens, num_heads, quant, is_pre)?,
+            mla_bmm_empirical(db, num_tokens, num_heads, quant, is_pre)? * head_scale,
             Source::Empirical,
         )),
         DatabaseMode::Hybrid => match db.mla.query_bmm(num_tokens, num_heads, quant, is_pre) {
-            Ok(latency) => Ok((latency, Source::Silicon)),
+            Ok(latency) => Ok((latency * head_scale, Source::Silicon)),
             Err(err) if err.is_missing_perf_data() => Ok((
-                mla_bmm_empirical(db, num_tokens, num_heads, quant, is_pre)?,
+                mla_bmm_empirical(db, num_tokens, num_heads, quant, is_pre)? * head_scale,
                 Source::Empirical,
             )),
             Err(err) => Err(err),
         },
-        _ => Ok((db.mla.query_bmm(num_tokens, num_heads, quant, is_pre)?, Source::Silicon)),
+        _ => Ok((
+            db.mla.query_bmm(num_tokens, num_heads, quant, is_pre)? * head_scale,
+            Source::Silicon,
+        )),
     }
 }
 
@@ -480,24 +530,33 @@ fn query_context_mla_module_table(
     kv_quant: KvCacheQuantMode,
     fmha_quant: FmhaQuantMode,
     gemm_quant: GemmQuantMode,
+    native_heads: Option<u32>,
 ) -> Result<(f64, Source), AicError> {
     let silicon = || -> Result<f64, AicError> {
         let full_s = s + prefix;
-        let raw = db
-            .mla
-            .query_context_module(b, full_s, num_heads, kv_quant, fmha_quant, gemm_quant)?;
+        let raw = db.mla.query_context_module(
+            b,
+            full_s,
+            num_heads,
+            kv_quant,
+            fmha_quant,
+            gemm_quant,
+            native_heads,
+        )?;
         Ok(raw * prefix_correction(full_s, prefix))
     };
     match db.database_mode {
         DatabaseMode::Empirical => Ok((
-            context_mla_module_empirical(db, b, s, prefix, num_heads, kv_quant, fmha_quant, gemm_quant)?,
+            context_mla_module_empirical(
+                db, b, s, prefix, num_heads, kv_quant, fmha_quant, gemm_quant, native_heads,
+            )?,
             Source::Empirical,
         )),
         DatabaseMode::Hybrid => match silicon() {
             Ok(latency) => Ok((latency, Source::Silicon)),
             Err(err) if err.is_missing_perf_data() => Ok((
                 context_mla_module_empirical(
-                    db, b, s, prefix, num_heads, kv_quant, fmha_quant, gemm_quant,
+                    db, b, s, prefix, num_heads, kv_quant, fmha_quant, gemm_quant, native_heads,
                 )?,
                 Source::Empirical,
             )),
@@ -520,19 +579,25 @@ fn context_mla_module_empirical(
     kv_quant: KvCacheQuantMode,
     fmha_quant: FmhaQuantMode,
     gemm_quant: GemmQuantMode,
+    native_heads: Option<u32>,
 ) -> Result<f64, AicError> {
     let spec = &db.system_spec;
     let attn_flops = quant_tc_flops(spec, fmha_quant.mapping())?;
     // c = (num_heads, full_s, b), prefix = 0 for collected samples.
     let sol = |c: &[f64]| context_mla_sol_ms(spec, kv_quant, c[0], c[1], c[2], attn_flops);
+    // Native in the cache key: distinct native buckets are distinct grids (#1458).
     let key = format!(
-        "ctx_mla_mod:{}:{}:{}",
+        "ctx_mla_mod:{}:{}:{}:{:?}",
         fmha_quant.name(),
         kv_quant.name(),
-        gemm_quant.name()
+        gemm_quant.name(),
+        native_heads
     );
     let grid = db.util_grids.get_or_try_build(&key, || {
-        match db.mla.context_module_points(kv_quant, fmha_quant, gemm_quant) {
+        match db
+            .mla
+            .context_module_points(kv_quant, fmha_quant, gemm_quant, native_heads)
+        {
             Ok(points) => Ok(Some(UtilGrid::new(util_empirical::build_samples(points, sol)))),
             Err(err) if err.is_missing_perf_data() => Ok(None),
             Err(err) => Err(err),
@@ -562,20 +627,23 @@ fn query_generation_mla_module_table(
     num_heads: u32,
     kv_quant: KvCacheQuantMode,
     gemm_quant: GemmQuantMode,
+    native_heads: Option<u32>,
 ) -> Result<(f64, Source), AicError> {
     match db.database_mode {
         DatabaseMode::Empirical => Ok((
-            generation_mla_module_empirical(db, b, s, num_heads, kv_quant, gemm_quant)?,
+            generation_mla_module_empirical(db, b, s, num_heads, kv_quant, gemm_quant, native_heads)?,
             Source::Empirical,
         )),
         DatabaseMode::Hybrid => {
             match db
                 .mla
-                .query_generation_module(b, s, num_heads, kv_quant, gemm_quant)
+                .query_generation_module(b, s, num_heads, kv_quant, gemm_quant, native_heads)
             {
                 Ok(latency) => Ok((latency, Source::Silicon)),
                 Err(err) if err.is_missing_perf_data() => Ok((
-                    generation_mla_module_empirical(db, b, s, num_heads, kv_quant, gemm_quant)?,
+                    generation_mla_module_empirical(
+                        db, b, s, num_heads, kv_quant, gemm_quant, native_heads,
+                    )?,
                     Source::Empirical,
                 )),
                 Err(err) => Err(err),
@@ -583,7 +651,7 @@ fn query_generation_mla_module_table(
         }
         _ => Ok((
             db.mla
-                .query_generation_module(b, s, num_heads, kv_quant, gemm_quant)?,
+                .query_generation_module(b, s, num_heads, kv_quant, gemm_quant, native_heads)?,
             Source::Silicon,
         )),
     }
@@ -599,6 +667,7 @@ fn generation_mla_module_empirical(
     num_heads: u32,
     kv_quant: KvCacheQuantMode,
     gemm_quant: GemmQuantMode,
+    native_heads: Option<u32>,
 ) -> Result<f64, AicError> {
     let spec = &db.system_spec;
     let attn_flops = generation_attn_flops(spec, kv_quant)?;
@@ -609,9 +678,14 @@ fn generation_mla_module_empirical(
             spec, kv_quant, gemm_quant, c[0], c[1], c[2], attn_flops, bmm_flops,
         )
     };
-    let key = format!("gen_mla_mod:{}:{}", kv_quant.name(), gemm_quant.name());
+    let key = format!(
+        "gen_mla_mod:{}:{}:{:?}",
+        kv_quant.name(),
+        gemm_quant.name(),
+        native_heads
+    );
     let grid = db.util_grids.get_or_try_build(&key, || {
-        match db.mla.generation_module_points(kv_quant, gemm_quant) {
+        match db.mla.generation_module_points(kv_quant, gemm_quant, native_heads) {
             Ok(points) => Ok(Some(UtilGrid::new(util_empirical::build_samples(points, sol)))),
             Err(err) if err.is_missing_perf_data() => Ok(None),
             Err(err) => Err(err),
@@ -795,11 +869,26 @@ mod tests {
             assert_eq!(source, Source::Empirical);
         }
 
-        // HYBRID at a head count absent from both the requested and the
-        // bfloat16 fallback slice -> terminal miss.
+        // HYBRID at a head count whose exact AND next-pow2 slices are both
+        // absent (gb200 tops out at 128 heads) -> terminal miss.
         db.database_mode = DatabaseMode::Hybrid;
-        let result = query_mla_bmm_table(&db, 64, 7, GemmQuantMode::Bfloat16, true);
+        let result = query_mla_bmm_table(&db, 64, 130, GemmQuantMode::Bfloat16, true);
         assert!(matches!(result, Err(AicError::EmpiricalNotImplemented(_))), "got {result:?}");
+    }
+
+    /// Exact-head-first routing: a non-pow2 head count without exact rows
+    /// (gb200's BMM table carries pow2 heads only) reroutes to the
+    /// next-pow2 slice scaled linearly by the head ratio. Python twin:
+    /// `tests/unit/sdk/operations/test_mla_bmm_head_routing.py`.
+    #[test]
+    fn mla_bmm_non_pow2_heads_reroute_to_next_pow2_slice() {
+        let db = gb200_trtllm_db();
+        let (lat7, source) =
+            query_mla_bmm_table(&db, 64, 7, GemmQuantMode::Bfloat16, true).expect("reroute");
+        let (lat8, _) =
+            query_mla_bmm_table(&db, 64, 8, GemmQuantMode::Bfloat16, true).expect("exact");
+        assert_eq!(source, Source::Silicon);
+        assert_close(lat7, lat8 * 7.0 / 8.0, "mla_bmm 7 -> 8-head slice reroute");
     }
 
     /// Python oracle: `MLAModule._query_context_mla_module_table` in
@@ -837,7 +926,7 @@ mod tests {
         ];
         for &(b, s, prefix, n, fmha, kv, gemm, expected) in cases {
             let (latency, source) =
-                query_context_mla_module_table(&db, b, s, prefix, n, kv, fmha, gemm)
+                query_context_mla_module_table(&db, b, s, prefix, n, kv, fmha, gemm, None)
                     .expect("empirical query");
             assert_close(
                 latency,
@@ -858,6 +947,7 @@ mod tests {
             KvCacheQuantMode::Bfloat16,
             FmhaQuantMode::Bfloat16,
             GemmQuantMode::Fp8,
+            None,
         );
         assert!(matches!(result, Err(AicError::EmpiricalNotImplemented(_))), "got {result:?}");
     }
@@ -877,8 +967,8 @@ mod tests {
             (8, 3000, 16, KvCacheQuantMode::Fp8, GemmQuantMode::Fp8Block, 0.1146692546817411),
         ];
         for &(b, s, n, kv, gemm, expected) in cases {
-            let (latency, source) =
-                query_generation_mla_module_table(&db, b, s, n, kv, gemm).expect("empirical query");
+            let (latency, source) = query_generation_mla_module_table(&db, b, s, n, kv, gemm, None)
+                .expect("empirical query");
             assert_close(
                 latency,
                 expected,
@@ -896,6 +986,7 @@ mod tests {
             128,
             KvCacheQuantMode::Bfloat16,
             GemmQuantMode::Fp8,
+            None,
         );
         assert!(matches!(result, Err(AicError::EmpiricalNotImplemented(_))), "got {result:?}");
     }

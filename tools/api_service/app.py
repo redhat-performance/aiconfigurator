@@ -15,6 +15,7 @@ from typing import Any
 import pandas as pd
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field, model_validator
 
@@ -295,6 +296,13 @@ app = FastAPI(
     description="GPU recommendation and memory estimation for LLM inference.",
     version="1.0.0",
     default_response_class=ORJSONResponse,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

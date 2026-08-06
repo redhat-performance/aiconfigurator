@@ -331,6 +331,15 @@ def post_recommend(
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    except AttributeError as e:
+        msg = str(e)
+        if "system_spec" in msg or "NoneType" in msg:
+            raise HTTPException(
+                status_code=422,
+                detail=f"No performance data available for model={req.model_path}, backend={req.backend}, system={req.system}.",
+            )
+        logger.exception("recommend failed")
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         logger.exception("recommend failed")
         raise HTTPException(status_code=500, detail=str(e))
@@ -380,8 +389,17 @@ def post_memory(req: MemoryRequest):
             comm_quant_mode=req.comm_quant_mode,
             tolerance_fraction=req.tolerance_fraction,
         )
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    except (ValueError, AttributeError) as e:
+        msg = str(e)
+        if "system_spec" in msg or "NoneType" in msg or "unsupported model" in msg.lower():
+            detail = (
+                f"No performance data available for model={req.model_path}, "
+                f"backend={req.backend}, system={req.system}"
+            )
+            if not req.backend_version:
+                detail += ". Try specifying a backend_version (e.g. '0.24.0' for vllm)."
+            raise HTTPException(status_code=422, detail=detail)
+        raise HTTPException(status_code=422, detail=msg)
     except Exception as e:
         logger.exception("memory estimation failed")
         raise HTTPException(status_code=500, detail=str(e))

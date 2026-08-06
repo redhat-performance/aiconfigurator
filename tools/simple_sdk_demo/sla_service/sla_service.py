@@ -318,28 +318,32 @@ def post_sla(
 
     return result_dict
 
-@app.post("/get_hardware")
+@app.get("/get_hardware")
 def get_hardware(
     detailed: bool = Body(False, description="whether to return detailed hardware information"),
 ):
     gpu_list = SupportedSystems
-    if detailed:
+    if not detailed:
         return gpu_list
     else:
-        return [load_system_spec(gpu.name)['gpu'] for gpu in gpu_list]
+        dict_list = []
+        for gpu in gpu_list:
+            full_dict = load_system_spec(gpu)
+            gpu_dict = full_dict['gpu'] | full_dict['node'] | full_dict['misc']
+            gpu_dict = {str(k): v if not isinstance(v, dict) else {str(kk): vv for kk, vv in v.items()} for k, v in gpu_dict.items()}
+            dict_list.append(gpu_dict)
+        return dict_list
 
 
 @app.get("/get_models")
-def get_model(
+def get_models(
     detailed: bool = Body(False, description="whether to return detailed model information"),
 ):
     default_models = get_default_models()
-    if detailed:
+    if not detailed:
         return default_models
     else:
-        return [get_model_config_from_model_path(model.name) for model in default_models]
-    model_config = get_model_config_from_model_path(model_path)
-    return model_config
+        return [get_model_config_from_model_path(model) for model in default_models]
 
 
 def parse(args):

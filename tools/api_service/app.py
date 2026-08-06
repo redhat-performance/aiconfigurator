@@ -25,6 +25,7 @@ from aiconfigurator.sdk.common import get_default_models
 from aiconfigurator.sdk.memory import estimate_kv_cache
 from aiconfigurator_core.sdk.common import SupportedSystems
 from aiconfigurator_core.sdk.perf_database import load_system_spec
+from aiconfigurator_core.sdk.utils import get_model_config_from_model_path
 
 logger = logging.getLogger(__name__)
 
@@ -466,9 +467,14 @@ def post_memory(req: MemoryRequest):
 
 
 @app.get("/models")
-def get_models():
-    """List supported models."""
-    return {"models": sorted(get_default_models())}
+def get_models(
+    detailed: bool = Query(False, description="whether to return detailed model information"),
+):
+    default_models = sorted(get_default_models())
+    if not detailed:
+        return {"models": default_models}
+    else:
+        return {"models": [get_model_config_from_model_path(model) for model in default_models]}
 
 
 @app.get("/systems")

@@ -520,6 +520,115 @@ class TestCLIRecommendUnit:
         assert captured_kwargs["enable_wideep"] is True
         assert captured_kwargs["moe_backend"] == "deepep_moe"
 
+    def test_dspark_nextn_auto_enabled_via_auto_path(self, monkeypatch):
+        """cli_recommend auto-enables DSPARK when nextn='auto' resolves to 0."""
+        import aiconfigurator.cli.api as api
+
+        captured = {}
+
+        def fake_build_default_tasks(**kwargs):
+            captured.update(kwargs)
+            return {}
+
+        def fake_execute(tasks, mode, **kwargs):
+            return ("agg", {"agg": pd.DataFrame({"x": [1]})}, {}, {}, {}, {})
+
+        monkeypatch.setattr(api, "build_default_tasks", fake_build_default_tasks)
+        monkeypatch.setattr(api, "_execute_tasks_internal", fake_execute)
+        monkeypatch.setattr(api, "_resolve_nextn_auto", lambda _: 0)
+        monkeypatch.setattr(api, "_resolve_dspark_nextn", lambda _: 7)
+
+        api.cli_recommend(
+            model_path="moonshotai/Kimi-K3",
+            system="h200_sxm",
+            target_concurrency=16,
+            # nextn="auto" by default
+        )
+
+        assert captured["nextn"] == 7
+        assert abs(captured["nextn_accepted"] - 7 * api._DSPARK_DEFAULT_ACCEPTANCE) < 1e-9
+
+    def test_dspark_explicit_nextn_zero_opts_out(self, monkeypatch):
+        """Explicit nextn=0 opts out of DSPARK — the model is sized without speculative decoding."""
+        import aiconfigurator.cli.api as api
+
+        captured = {}
+
+        def fake_build_default_tasks(**kwargs):
+            captured.update(kwargs)
+            return {}
+
+        def fake_execute(tasks, mode, **kwargs):
+            return ("agg", {"agg": pd.DataFrame({"x": [1]})}, {}, {}, {}, {})
+
+        monkeypatch.setattr(api, "build_default_tasks", fake_build_default_tasks)
+        monkeypatch.setattr(api, "_execute_tasks_internal", fake_execute)
+        monkeypatch.setattr(api, "_resolve_dspark_nextn", lambda _: 7)
+
+        api.cli_recommend(
+            model_path="moonshotai/Kimi-K3",
+            system="h200_sxm",
+            target_concurrency=16,
+            nextn=0,  # explicit opt-out
+        )
+
+        assert captured["nextn"] == 0
+
+    def test_dspark_explicit_nextn_accepted_not_overridden(self, monkeypatch):
+        """Explicit nextn_accepted is preserved when DSPARK is auto-detected."""
+        import aiconfigurator.cli.api as api
+
+        captured = {}
+
+        def fake_build_default_tasks(**kwargs):
+            captured.update(kwargs)
+            return {}
+
+        def fake_execute(tasks, mode, **kwargs):
+            return ("agg", {"agg": pd.DataFrame({"x": [1]})}, {}, {}, {}, {})
+
+        monkeypatch.setattr(api, "build_default_tasks", fake_build_default_tasks)
+        monkeypatch.setattr(api, "_execute_tasks_internal", fake_execute)
+        monkeypatch.setattr(api, "_resolve_nextn_auto", lambda _: 0)
+        monkeypatch.setattr(api, "_resolve_dspark_nextn", lambda _: 7)
+
+        api.cli_recommend(
+            model_path="moonshotai/Kimi-K3",
+            system="h200_sxm",
+            target_concurrency=16,
+            nextn_accepted=3.0,
+        )
+
+        assert captured["nextn"] == 7
+        assert captured["nextn_accepted"] == 3.0
+
+    def test_non_dspark_model_unaffected(self, monkeypatch):
+        """Non-DSPARK models resolve to nextn=0 and stay there."""
+        import aiconfigurator.cli.api as api
+
+        captured = {}
+
+        def fake_build_default_tasks(**kwargs):
+            captured.update(kwargs)
+            return {}
+
+        def fake_execute(tasks, mode, **kwargs):
+            return ("agg", {"agg": pd.DataFrame({"x": [1]})}, {}, {}, {}, {})
+
+        monkeypatch.setattr(api, "build_default_tasks", fake_build_default_tasks)
+        monkeypatch.setattr(api, "_execute_tasks_internal", fake_execute)
+        monkeypatch.setattr(api, "_resolve_nextn_auto", lambda _: 0)
+        monkeypatch.setattr(api, "_resolve_dspark_nextn", lambda _: None)
+
+        api.cli_recommend(
+            model_path="Qwen/Qwen3-32B",
+            system="h200_sxm",
+            target_concurrency=16,
+        )
+
+        assert captured["nextn"] == 0
+        assert captured["nextn_accepted"] is None
+
     def test_escalates_on_oom(self, monkeypatch):
         import aiconfigurator.cli.api as api
         from aiconfigurator.sdk.errors import ExperimentOutcome, InsufficientMemoryError
@@ -537,6 +646,10 @@ class TestCLIRecommendUnit:
                 moe_backend: str | None = None
                 agg_pp_candidates: list = field(default_factory=lambda: [1])
                 agg_num_gpu_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                agg_tp_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                agg_dp_candidates: list = field(default_factory=lambda: [1])
+                agg_moe_tp_candidates: list = field(default_factory=lambda: [1])
+                agg_moe_ep_candidates: list = field(default_factory=lambda: [1])
 
             return {"agg": FakeTask()}
 
@@ -574,6 +687,10 @@ class TestCLIRecommendUnit:
                 moe_backend: str | None = None
                 agg_pp_candidates: list = field(default_factory=lambda: [1])
                 agg_num_gpu_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                agg_tp_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                agg_dp_candidates: list = field(default_factory=lambda: [1])
+                agg_moe_tp_candidates: list = field(default_factory=lambda: [1])
+                agg_moe_ep_candidates: list = field(default_factory=lambda: [1])
 
             return {"agg": FakeTask()}
 
@@ -608,6 +725,10 @@ class TestCLIRecommendUnit:
                 moe_backend: str | None = None
                 agg_pp_candidates: list = field(default_factory=lambda: [1])
                 agg_num_gpu_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                agg_tp_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                agg_dp_candidates: list = field(default_factory=lambda: [1])
+                agg_moe_tp_candidates: list = field(default_factory=lambda: [1])
+                agg_moe_ep_candidates: list = field(default_factory=lambda: [1])
 
             return {"agg": FakeTask()}
 
@@ -647,10 +768,22 @@ class TestCLIRecommendUnit:
                 moe_backend: str | None = None
                 agg_pp_candidates: list = field(default_factory=lambda: [1])
                 agg_num_gpu_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                agg_tp_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                agg_dp_candidates: list = field(default_factory=lambda: [1])
+                agg_moe_tp_candidates: list = field(default_factory=lambda: [1])
+                agg_moe_ep_candidates: list = field(default_factory=lambda: [1])
                 prefill_pp_candidates: list = field(default_factory=lambda: [1])
                 prefill_num_gpu_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                prefill_tp_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                prefill_dp_candidates: list = field(default_factory=lambda: [1])
+                prefill_moe_tp_candidates: list = field(default_factory=lambda: [1])
+                prefill_moe_ep_candidates: list = field(default_factory=lambda: [1])
                 decode_pp_candidates: list = field(default_factory=lambda: [1])
                 decode_num_gpu_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                decode_tp_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                decode_dp_candidates: list = field(default_factory=lambda: [1])
+                decode_moe_tp_candidates: list = field(default_factory=lambda: [1])
+                decode_moe_ep_candidates: list = field(default_factory=lambda: [1])
 
             return {"agg": FakeTask(), "disagg": FakeTask(serving_mode="disagg")}
 
@@ -723,6 +856,10 @@ class TestCLIRecommendUnit:
                 serving_mode: str = "agg"
                 agg_pp_candidates: list = field(default_factory=lambda: [1])
                 agg_num_gpu_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                agg_tp_candidates: list = field(default_factory=lambda: [1, 2, 4, 8])
+                agg_dp_candidates: list = field(default_factory=lambda: [1])
+                agg_moe_tp_candidates: list = field(default_factory=lambda: [1])
+                agg_moe_ep_candidates: list = field(default_factory=lambda: [1])
 
             return {"agg": FakeTask()}
 
@@ -780,3 +917,41 @@ def test_disagg_estimate_honors_explicit_free_gpu_memory_fraction():
     assert result is not None
     with pytest.raises(RuntimeError, match="OOM"):
         cli_estimate(**common_kw, free_gpu_memory_fraction=0.001)
+
+
+class TestResolveDsparkNextn:
+    """Unit tests for resolve_dspark_nextn in config_builders."""
+
+    def test_non_dspark_returns_none(self, monkeypatch):
+        from aiconfigurator_core.sdk.config_builders import resolve_dspark_nextn
+
+        monkeypatch.setattr(
+            "aiconfigurator_core.sdk.utils.get_model_config_from_model_path",
+            lambda _: {"architecture": "LlamaForCausalLM"},
+        )
+        assert resolve_dspark_nextn("meta-llama/Llama-3.1-8B-Instruct") is None
+
+    def test_kimi_k3_returns_block_size(self, monkeypatch):
+        from aiconfigurator_core.sdk.config_builders import resolve_dspark_nextn
+
+        monkeypatch.setattr(
+            "aiconfigurator_core.sdk.utils.get_model_config_from_model_path",
+            lambda _: {"architecture": "KimiK3ForConditionalGeneration"},
+        )
+        result = resolve_dspark_nextn("moonshotai/Kimi-K3")
+        assert result == 7
+
+    def test_empty_model_path_raises(self):
+        from aiconfigurator_core.sdk.config_builders import resolve_dspark_nextn
+
+        with pytest.raises(ValueError, match="requires a model path"):
+            resolve_dspark_nextn("")
+
+    def test_fetch_failure_returns_none(self, monkeypatch):
+        from aiconfigurator_core.sdk.config_builders import resolve_dspark_nextn
+
+        monkeypatch.setattr(
+            "aiconfigurator_core.sdk.utils.get_model_config_from_model_path",
+            lambda _: (_ for _ in ()).throw(RuntimeError("network error")),
+        )
+        assert resolve_dspark_nextn("some/model") is None

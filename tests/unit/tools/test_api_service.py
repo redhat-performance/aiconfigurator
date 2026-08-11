@@ -602,4 +602,225 @@ class TestIntegration:
         assert len(systems) > 0
         assert all(s["memory_bytes"] > 0 for s in systems)
 
+    def test_estimate_real(self):
+        resp = client.post("/estimate", json={
+            "model_path": "Qwen/Qwen3-32B",
+            "system": "h200_sxm",
+            "backend": "vllm",
+            "tp_size": 2,
+            "batch_size": 48,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ttft"] > 0
+        assert data["tpot"] > 0
+        assert data["tokens_per_second"] > 0
 
+    def test_estimate_with_include_real(self):
+        resp = client.post("/estimate?include=config,memory", json={
+            "model_path": "Qwen/Qwen3-32B",
+            "system": "h200_sxm",
+            "backend": "vllm",
+            "backend_version": "0.24.0",
+            "tp_size": 2,
+            "batch_size": 48,
+        })
+        assert resp.status_code == 200
+        cfg = resp.json()
+        assert cfg["serving_config"] is not None
+        assert cfg["serving_config"]["tensor_parallel_size"] == 2
+
+
+# ─── /recommend disagg tests ──────────────────────────────────────────────────
+
+
+class TestRecommendDisagg:
+
+    @patch("tools.api_service.app.cli_recommend")
+    def test_disagg_result_has_prefill_decode_configs(self, mock_recommend):
+        disagg_row = {
+            "model": "Qwen/Qwen3-32B", "isl": 1000, "osl": 150,
+            "concurrency": 36, "ttft": 180.157, "tpot": 24.675,
+            "tokens/s": 1348.785, "tokens/s/gpu": 674.392,
+            "num_total_gpus": 2, "total_gpus_needed": 6, "replicas_needed": 3,
+            "request_rate": 8.992, "request_latency": 3856.732,
+            "encoder_latency": 0.0, "encoder_memory": 0.0,
+            "seq/s": 8.992, "seq/s/gpu": 4.496,
+            "tokens/s/user": 40.527, "power_w": 0.0,
+            "(p)tp": np.int64(1), "(p)pp": np.int64(1), "(p)dp": np.int64(1),
+            "(p)workers": np.int64(1), "(p)memory": 64.9,
+            "(p)gemm": "bfloat16", "(p)kvcache": "bfloat16",
+            "(p)fmha": "bfloat16", "(p)moe": "bfloat16", "(p)comm": "half",
+            "(p)version": "0.24.0",
+            "(d)tp": np.int64(1), "(d)pp": np.int64(1), "(d)dp": np.int64(1),
+            "(d)workers": np.int64(1), "(d)memory": 64.9,
+            "(d)gemm": "bfloat16", "(d)version": "0.24.0",
+        }
+        result = make_mock_cli_result([disagg_row])
+        result.chosen_exp = "disagg_vllm"
+        result.best_configs = {"disagg_vllm": pd.DataFrame([disagg_row])}
+        mock_recommend.return_value = result
+
+        resp = client.post("/recommend", json=VALID_RECOMMEND_BODY)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "disagg" in data["chosen_mode"]
+        cfg = data["configs"][0]
+        assert cfg["tp"] is None
+        assert cfg["prefill_config"] is not None
+        assert cfg["decode_config"] is not None
+        assert cfg["prefill_config"]["tp"] == 1
+        assert cfg["decode_config"]["tp"] == 1
+        assert cfg["total_gpus_needed"] == 6
+        assert cfg["memory"] == pytest.approx(129.8)
+
+    @patch("tools.api_service.app.cli_recommend")
+    def test_agg_result_has_no_prefill_decode(self, mock_recommend):
+        mock_recommend.return_value = make_mock_cli_result()
+        resp = client.post("/recommend", json=VALID_RECOMMEND_BODY)
+        assert resp.status_code == 200
+        cfg = resp.json()["configs"][0]
+        assert cfg["tp"] == 2
+        assert cfg["prefill_config"] is None
+        assert cfg["decode_config"] is None
+
+
+# ─── /estimate tests ──────────────────────────────────────────────────────────
+
+MOCK_ESTIMATE_RESULT_RAW = {
+    "model": "Qwen/Qwen3-32B", "isl": 4000, "osl": 1000,
+    "ttft": 471.378, "tpot": 28.118, "request_latency": 28561.14,
+    "bs": np.int64(128), "global_bs": np.int64(128),
+    "tokens/s": 1678.925, "tokens/s/gpu": 839.462, "tokens/s/user": 35.565,
+    "num_total_gpus": np.int64(2),
+    "tp": np.int64(2), "pp": np.int64(1), "dp": np.int64(1),
+    "memory": 64.044,
+    "backend": "vllm", "version": "0.24.0", "system": "h200_sxm",
+    "gemm": "bfloat16", "kvcache": "bfloat16",
+    "power_w": 0.0,
+}
+
+VALID_ESTIMATE_BODY = {
+    "model_path": "Qwen/Qwen3-32B",
+    "system": "h200_sxm",
+    "backend": "vllm",
+    "isl": 4000,
+    "osl": 1000,
+    "tp_size": 2,
+    "batch_size": 128,
+}
+
+
+def make_mock_estimate_result():
+    mock = MagicMock()
+    mock.ttft = 471.378
+    mock.tpot = 28.118
+    mock.power_w = 0.0
+    mock.raw = MOCK_ESTIMATE_RESULT_RAW
+    return mock
+
+
+class TestEstimate:
+
+    @patch("tools.api_service.app.cli_estimate")
+    def test_success(self, mock_estimate):
+        mock_estimate.return_value = make_mock_estimate_result()
+        resp = client.post("/estimate", json=VALID_ESTIMATE_BODY)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ttft"] == pytest.approx(471.378)
+        assert data["tpot"] == pytest.approx(28.118)
+        assert data["tokens_per_second"] == pytest.approx(1678.925)
+        assert data["tp"] == 2
+        assert data["serving_config"] is None
+        assert data["memory_breakdown"] is None
+
+    @patch("tools.api_service.app.cli_estimate")
+    def test_include_config(self, mock_estimate):
+        mock_estimate.return_value = make_mock_estimate_result()
+        resp = client.post("/estimate?include=config", json=VALID_ESTIMATE_BODY)
+        assert resp.status_code == 200
+        sc = resp.json()["serving_config"]
+        assert sc is not None
+        assert sc["tensor_parallel_size"] == 2
+
+    @patch("tools.api_service.app.estimate_kv_cache")
+    @patch("tools.api_service.app.cli_estimate")
+    def test_include_memory(self, mock_estimate, mock_kv):
+        mock_estimate.return_value = make_mock_estimate_result()
+        mock_kv.return_value = MOCK_KV_CACHE_RESULT
+        resp = client.post("/estimate?include=memory", json=VALID_ESTIMATE_BODY)
+        assert resp.status_code == 200
+        mb = resp.json()["memory_breakdown"]
+        assert mb is not None
+        assert mb["weights_bytes"] == 32761446400
+
+    @patch("tools.api_service.app.estimate_kv_cache")
+    @patch("tools.api_service.app.cli_estimate")
+    def test_include_config_and_memory(self, mock_estimate, mock_kv):
+        mock_estimate.return_value = make_mock_estimate_result()
+        mock_kv.return_value = MOCK_KV_CACHE_RESULT
+        resp = client.post("/estimate?include=config,memory", json=VALID_ESTIMATE_BODY)
+        assert resp.status_code == 200
+        assert resp.json()["serving_config"] is not None
+        assert resp.json()["memory_breakdown"] is not None
+
+    @patch("tools.api_service.app.cli_estimate")
+    def test_calls_sdk_with_correct_params(self, mock_estimate):
+        mock_estimate.return_value = make_mock_estimate_result()
+        client.post("/estimate", json=VALID_ESTIMATE_BODY)
+        kwargs = mock_estimate.call_args.kwargs
+        assert kwargs["system_name"] == "h200_sxm"
+        assert kwargs["backend_name"] == "vllm"
+        assert kwargs["tp_size"] == 2
+        assert kwargs["batch_size"] == 128
+
+    def test_requires_model_path(self):
+        body = {**VALID_ESTIMATE_BODY}
+        del body["model_path"]
+        resp = client.post("/estimate", json=body)
+        assert resp.status_code == 422
+
+    def test_requires_system(self):
+        body = {**VALID_ESTIMATE_BODY}
+        del body["system"]
+        resp = client.post("/estimate", json=body)
+        assert resp.status_code == 422
+
+    @patch("tools.api_service.app.cli_estimate")
+    def test_value_error_returns_422(self, mock_estimate):
+        mock_estimate.side_effect = ValueError("unsupported model/backend/GPU for estimation")
+        resp = client.post("/estimate", json=VALID_ESTIMATE_BODY)
+        assert resp.status_code == 422
+
+    @patch("tools.api_service.app.cli_estimate")
+    def test_unexpected_error_returns_500(self, mock_estimate):
+        mock_estimate.side_effect = RuntimeError("crash")
+        resp = client.post("/estimate", json=VALID_ESTIMATE_BODY)
+        assert resp.status_code == 500
+
+    @patch("tools.api_service.app.cli_estimate")
+    def test_model_config_accepted(self, mock_estimate):
+        mock_estimate.return_value = make_mock_estimate_result()
+        body = {**VALID_ESTIMATE_BODY, "model_config": {"hidden_size": 8192, "architectures": ["LlamaForCausalLM"]}}
+        resp = client.post("/estimate", json=body)
+        assert resp.status_code == 200
+
+
+# ─── model_config passthrough tests ──────────────────────────────────────────
+
+class TestModelConfigPassthrough:
+
+    @patch("tools.api_service.app.cli_recommend")
+    def test_recommend_accepts_model_config(self, mock_recommend):
+        mock_recommend.return_value = make_mock_cli_result()
+        body = {**VALID_RECOMMEND_BODY, "model_config": {"hidden_size": 8192, "architectures": ["LlamaForCausalLM"]}}
+        resp = client.post("/recommend", json=body)
+        assert resp.status_code == 200
+
+    @patch("tools.api_service.app.estimate_kv_cache")
+    def test_memory_accepts_model_config(self, mock_kv):
+        mock_kv.return_value = MOCK_KV_CACHE_RESULT
+        body = {**VALID_MEMORY_BODY, "model_config": {"hidden_size": 8192, "architectures": ["LlamaForCausalLM"]}}
+        resp = client.post("/memory", json=body)
+        assert resp.status_code == 200

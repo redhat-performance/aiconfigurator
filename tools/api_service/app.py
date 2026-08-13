@@ -24,6 +24,7 @@ from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from aiconfigurator.cli.api import cli_estimate, cli_recommend, _execute_and_wrap_result, _build_recommend_tasks
+from aiconfigurator.sdk.errors import NoFeasibleConfigError
 from aiconfigurator.cli.main import build_default_tasks
 from aiconfigurator.sdk.common import get_default_models
 from aiconfigurator.sdk.memory import estimate_kv_cache
@@ -461,6 +462,8 @@ def _build_memory_breakdown(
 
 def _common_error_handler(e: Exception, op: str, model_path: str, backend: str, system: str) -> None:
     msg = str(e)
+    if isinstance(e, NoFeasibleConfigError):
+        raise HTTPException(status_code=422, detail=msg)
     if isinstance(e, (ValueError, AttributeError)):
         if "system_spec" in msg or "NoneType" in msg or "unsupported model" in msg.lower():
             detail = f"No performance data available for model={model_path}, backend={backend}, system={system}."
@@ -567,6 +570,8 @@ def post_recommend(
             result = _recommend_quick(req)
         else:
             result = _recommend_full(req)
+    except NoFeasibleConfigError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except AttributeError as e:

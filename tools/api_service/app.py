@@ -791,25 +791,27 @@ def get_systems(
 
     systems = []
     for sys_id in sorted(SupportedSystems):
-        entry: dict[str, Any] = {
-            "id": sys_id,
-            "name": _system_display_name(sys_id),
-        }
-        if want_specs:
-            try:
-                spec = load_system_spec(sys_id)
+        entry: dict[str, Any] = {"id": sys_id}
+        try:
+            spec = load_system_spec(sys_id)
+            misc = spec.get("misc", {})
+            entry["name"] = misc.get("name", sys_id)
+            if want_specs:
                 gpu = spec.get("gpu", {})
                 node = spec.get("node", {})
                 sm = int(gpu.get("sm_version", 0))
                 entry.update({
-                    "vendor": spec.get("misc", {}).get("vendor", "unknown"),
+                    "vendor": misc.get("vendor", "unknown"),
                     "architecture": _architecture_from_sm(sm),
                     "memory_bytes": int(gpu.get("mem_capacity", 0)),
                     "tdp_watts": float(gpu.get("power", 0)),
                     "gpus_per_node": int(node.get("num_gpus_per_node", 0)),
+                    "memory_bandwidth_bytes": int(gpu.get("mem_bw", 0)),
+                    "bf16_tflops": gpu.get("bfloat16_tc_flops", 0) / 1e12,
                 })
-            except Exception:
-                logger.warning("failed to load spec for %s", sys_id)
+        except Exception:
+            logger.warning("failed to load spec for %s", sys_id)
+            entry.setdefault("name", sys_id)
         systems.append(entry)
     return {"systems": systems}
 

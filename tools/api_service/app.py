@@ -476,7 +476,9 @@ def _architecture_from_sm(sm_version: int) -> str:
 
 def _system_display_name(system_id: str) -> str:
     parts = system_id.replace("_", " ").upper().split()
-    return "NVIDIA " + " ".join(parts)
+    spec = load_system_spec(system_id)
+    vendor_name = spec.get("misc", {}).get("vendor", "unknown")
+    return str.title(vendor_name) + " " + " ".join(parts)
 
 
 def _parse_include(include: str | None) -> set[str]:
@@ -800,7 +802,7 @@ def get_systems(
                 node = spec.get("node", {})
                 sm = int(gpu.get("sm_version", 0))
                 entry.update({
-                    "vendor": "nvidia",
+                    "vendor": spec.get("misc", {}).get("vendor", "unknown"),
                     "architecture": _architecture_from_sm(sm),
                     "memory_bytes": int(gpu.get("mem_capacity", 0)),
                     "tdp_watts": float(gpu.get("power", 0)),

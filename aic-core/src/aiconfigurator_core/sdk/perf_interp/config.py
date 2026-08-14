@@ -31,10 +31,13 @@ Resolution order (the whole engine in four steps)
      evaluate its curve alone; otherwise pick the nearest sites (log-space
      distance, filtered to sites whose curve range covers the query) and
      combine their curve evaluations in UTIL space by inverse-distance weight.
-3. **beyond the collected range** -> hold the boundary util
-   (``util = SOL/latency``, anchored on the median of the last ``k_tail``
-   points so a sawtooth edge doesn't bias it) and return
-   ``latency = SOL(query) / util``. Extrapolation is UNBOUNDED by design:
+3. **beyond the collected range** -> hold a boundary util
+   (``util = SOL/latency``) and return ``latency = SOL(query) / util``.
+   Multi-axis Grids transfer the util from the ``nn_leaves`` nearest collected
+   points in joint log2 space (inverse-distance blend — continuous in the
+   query, no nearest-path snap); curves and 1-D tables anchor on the median of
+   the last ``k_tail`` points so a sawtooth edge doesn't bias it.
+   Extrapolation is UNBOUNDED by design:
    outside the data, the analytic SOL is the only signal we have — holding
    measured efficiency and letting physics carry the growth is the honest
    answer at any distance, so there is no distance cap.
@@ -147,6 +150,18 @@ class ScatteredSites:
     #: point) — k_tail is a robustness knob, not a data-sufficiency gate; a
     #: genuine miss is raised only when NO positive-util anchor exists.
     k_tail: int = 3
+    #: A "site" is one fixed combination of ``site_axes`` values; it owns a
+    #: one-dimensional curve over ``curve_axis``. Normally, when a query
+    #: matches a collected site, only that site's curve is used — which
+    #: assumes every site owns a representative curve. That holds for GEMM's
+    #: real (n,k) shapes but is violated by tables whose axis rules emit
+    #: stray coordinates backed by a few sweep points (FPM's max-batch /
+    #: capacity-endpoint orphans). When True, an own curve that does NOT
+    #: cover the query coordinate defers to neighbour-site transfer (the own
+    #: site is excluded from candidates) instead of holding its own tail.
+    #: In-range own-site behavior and exact hits are unchanged. Default
+    #: False preserves stock behavior exactly.
+    own_curve_coverage_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -155,14 +170,29 @@ class Grid:
 
     Descends the table's own nesting order; per level: exact key collapses the
     level, otherwise bracket + blend; beyond the collected range (including the
-    truncated corner) clamp and hold the boundary util.
+    truncated corner) hold a boundary util. Multi-axis tables transfer that
+    util from the ``nn_leaves`` nearest collected points in joint log2 space
+    (continuous in the query — no nearest-path snap, so the staircase frontier
+    produces no outer-axis midpoint cliffs); 1-D curves anchor on the k_tail
+    median of the boundary points.
     """
 
-    #: Boundary-util anchor = median of the last k_tail points along the
-    #: innermost axis. 1 = plain boundary point (grids have no sawtooth).
-    #: Fewer than k_tail collected points -> median of what exists, same as
+    #: 1-D curves only: boundary-util anchor = median of the last k_tail
+    #: points. 1 = plain boundary point (grids have no sawtooth). Fewer than
+    #: k_tail collected points -> median of what exists, same as
     #: ScatteredSites (never a miss on its own).
     k_tail: int = 1
+    #: Multi-axis hold: how many nearest valid leaves (joint log2 distance) to
+    #: blend in util space. Weights are tapered modified-Shepard
+    #: (Franke-Little): w = ((R-d)/(R*d))^2 with support radius R at the
+    #: (nn_leaves+1)-th valid distance (R = inf -> plain 1/d^2 when the table
+    #: is that small). A neighbour enters/leaves the support at zero weight,
+    #: so the hold is continuous across rank swaps and needs no tie ordering —
+    #: independent of axis order and table insertion order. 4 won the
+    #: frontier-holdout LOO on 11 real attention/MLA tables (deep-tail p90 vs
+    #: nearest-snap roughly halved, max tail 100%->25% on b200 ctx-attn; the
+    #: taper matched or beat the hard cutoff on every fold).
+    nn_leaves: int = 4
 
 
 @dataclass(frozen=True)
@@ -197,6 +227,8 @@ class OpInterpConfig:
             raise ValueError(f"transform_axis {self.transform_axis!r} is not one of the table axes {self.axes}")
         if self.resolver.k_tail < 1:
             raise ValueError(f"k_tail must be >= 1, got {self.resolver.k_tail}")
+        if isinstance(self.resolver, Grid) and self.resolver.nn_leaves < 1:
+            raise ValueError(f"nn_leaves must be >= 1, got {self.resolver.nn_leaves}")
         if isinstance(self.resolver, Grid) and self.value_transform is ValueTransform.UTIL:
             raise ValueError("in-slice UTIL transform is not wired for Grid (no op has won LOO with it)")
         if isinstance(self.resolver, ScatteredSites):

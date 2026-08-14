@@ -413,6 +413,10 @@ def cli_default(
     image_width: int = 0,
     num_images: int = 1,
     enable_encoder_dp: bool = True,
+    enable_epd: bool = False,
+    encoder_tp: list[int] | None = None,
+    encoder_system: str | None = None,
+    encoder_latency_correction: float = 1.0,
     ttft: float = 2000.0,
     tpot: float = 30.0,
     request_latency: float | None = None,
@@ -428,6 +432,7 @@ def cli_default(
     generator_config: str | None = None,
     generator_dynamo_version: str | None = None,
     engine_step_backend: str | None = None,
+    forward_model: str | None = None,
 ) -> CLIResult:
     """
     Run the default CLI mode: compare aggregated vs disaggregated serving.
@@ -471,6 +476,14 @@ def cli_default(
             Used to filter batch sizes that would exceed KV cache capacity.
         max_seq_len: TRT-LLM ``--max_seq_len`` setting. Controls how many KV blocks are
             pre-allocated per sequence. Defaults to ``isl + osl`` when ``None``.
+        enable_epd: VL models -- serve the vision encoder from a dedicated
+            encode-worker pool (agg becomes E+agg, disagg becomes E+P+D).
+            Requires an image workload (image_height/image_width).
+        encoder_tp: EPD encode-worker TP sizes to sweep (default [1, 2, 4, 8]).
+        encoder_system: System (GPU type) for the encode workers; defaults to
+            the prefill/agg side's system.
+        encoder_latency_correction: Latency correction scale for the encode
+            workers.  Default 1.0.
         top_n: Number of top configurations to return for each mode (agg/disagg). Default is 5.
         save_dir: Directory to save results. If None, results are not saved to disk.
         generator_set: List of inline generator overrides in KEY=VALUE format (e.g.,
@@ -478,7 +491,9 @@ def cli_default(
             Equivalent to repeating ``--generator-set`` on the CLI.
         generator_config: Path to a unified generator YAML config file.
         generator_dynamo_version: Override Dynamo version used by the generator.
-        engine_step_backend: Experimental static latency backend ("python" or "rust").
+        engine_step_backend: Engine-step backend; "rust" (the compiled engine,
+            default and only executor) or the deprecated no-op "python".
+        forward_model: Forward-pass modeling mode ("op_level" or "fpm"). None keeps the default.
 
     Returns:
         CLIResult with chosen experiment, best configs, pareto fronts, and throughputs.
@@ -537,6 +552,10 @@ def cli_default(
         image_width=image_width,
         num_images=num_images,
         enable_encoder_dp=enable_encoder_dp,
+        enable_epd=enable_epd,
+        encoder_tp=encoder_tp,
+        encoder_system=encoder_system,
+        encoder_latency_correction=encoder_latency_correction,
         ttft=ttft,
         tpot=tpot,
         request_latency=request_latency,
@@ -546,6 +565,7 @@ def cli_default(
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         max_seq_len=max_seq_len,
         engine_step_backend=engine_step_backend,
+        forward_model=forward_model,
     )
 
     result = _execute_and_wrap_result(tasks, mode="default", top_n=top_n, strict_sla=strict_sla)
@@ -645,6 +665,7 @@ def cli_recommend(
     top_n: int = 5,
     save_dir: str | None = None,
     engine_step_backend: str | None = None,
+    forward_model: str | None = None,
 ) -> CLIResult:
     """Find the minimum number of GPUs to meet a performance target.
 
@@ -694,7 +715,10 @@ def cli_recommend(
         moe_backend: Explicit SGLang MoE backend override.
         top_n: Number of top configurations to return per mode. Default is 5.
         save_dir: Directory to save results. If None, results are not saved.
-        engine_step_backend: Experimental static latency backend.
+        engine_step_backend: Engine-step backend; "rust" (the compiled engine,
+            default and only executor) or the deprecated no-op "python".
+        forward_model: Forward-pass modeling mode ("op_level" or "fpm").
+            None keeps the default.
 
     Returns:
         CLIResult with best configs containing ``total_gpus_needed`` and
@@ -755,6 +779,7 @@ def cli_recommend(
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         max_seq_len=max_seq_len,
         engine_step_backend=engine_step_backend,
+        forward_model=forward_model,
         enable_wideep=enable_wideep,
         moe_backend=moe_backend,
     )
@@ -1126,9 +1151,22 @@ def _apply_power_coverage_gate(summary, result_dict: dict) -> dict:
     power is unavailable without treating the whole estimate as failed.
     """
     gated = dict(result_dict)
-    coverage = summary.get_power_data_coverage()
-    gated["power_coverage"] = coverage
-    if coverage < POWER_DATA_COVERAGE_THRESHOLD:
+    gated["power_coverage"] = summary.get_power_data_coverage()
+    return apply_row_power_coverage_gate(gated)
+
+
+def apply_row_power_coverage_gate(row: dict) -> dict:
+    """Hide ``power_w`` when ``power_coverage`` is missing, non-finite, or
+    below the coverage threshold (fail-closed)."""
+    import math
+
+    gated = dict(row)
+    coverage = gated.get("power_coverage")
+    if (
+        not isinstance(coverage, (int, float))
+        or not math.isfinite(coverage)
+        or coverage < POWER_DATA_COVERAGE_THRESHOLD
+    ):
         gated["power_w"] = None
     return gated
 
@@ -1204,6 +1242,7 @@ def cli_estimate(
     free_gpu_memory_fraction: float | None = None,
     max_seq_len: int | None = None,
     engine_step_backend: str | None = None,
+    forward_model: str | None = None,
     # Static-mode (and shared) extras
     prefix: int = 0,
     nextn: int | str = 0,
@@ -1291,7 +1330,8 @@ def cli_estimate(
         max_seq_len: The TRT-LLM ``--max_seq_len`` setting used at serving time.
             Controls how many KV blocks TRT-LLM pre-allocates per sequence. Defaults
             to ``isl + osl`` when ``None``.
-        engine_step_backend: Experimental static latency backend ("python" or "rust").
+        engine_step_backend: Engine-step backend; "rust" (the compiled engine,
+            default and only executor) or the deprecated no-op "python".
         prefix: (common) Prefix cache length (subset of ``isl`` already cached).
             Applied to agg, disagg, and all static modes. Default 0.
         nextn: (common) MTP draft length, or ``"auto"`` to use the checkpoint's
@@ -1444,6 +1484,7 @@ def cli_estimate(
             nextn_accepted=nextn_accepted,
             stride=stride,
             engine_step_backend=engine_step_backend,
+            forward_model=forward_model,
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
@@ -1480,6 +1521,7 @@ def cli_estimate(
             free_gpu_memory_fraction=free_gpu_memory_fraction,
             max_seq_len=max_seq_len,
             engine_step_backend=engine_step_backend,
+            forward_model=forward_model,
             prefix=prefix,
             nextn=nextn,
             nextn_accepted=nextn_accepted,
@@ -1546,11 +1588,17 @@ def cli_estimate(
             get_backend=get_backend,
             get_model=get_model,
             engine_step_backend=engine_step_backend,
+            forward_model=forward_model,
             prefix=prefix,
             nextn=nextn,
             nextn_accepted=nextn_accepted,
         )
     elif mode == "afd":
+        if forward_model == "fpm":
+            raise ValueError(
+                "forward_model='fpm' is not supported in afd mode: AFD splits attention and FFN "
+                "across workers, which is incompatible with whole-model forward-pass data."
+            )
         for name, val in [
             ("n_a_nodes", n_a_nodes),
             ("n_f_nodes", n_f_nodes),
@@ -1695,6 +1743,7 @@ def _run_agg_estimate(
     free_gpu_memory_fraction=None,
     max_seq_len=None,
     engine_step_backend=None,
+    forward_model=None,
     # Common (also accepted by disagg / static)
     prefix: int = 0,
     nextn: int = 0,
@@ -1719,6 +1768,7 @@ def _run_agg_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        forward_model=forward_model,
         enable_encoder_dp=enable_encoder_dp,
     )
     _apply_nextn(model_config, nextn)
@@ -1830,6 +1880,7 @@ def _run_static_estimate(
     load_database,
     get_backend,
     get_model,
+    forward_model=None,
 ) -> EstimateResult:
     """Run a single-pass static-batching estimation.
 
@@ -1859,6 +1910,7 @@ def _run_static_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        forward_model=forward_model,
         enable_encoder_dp=enable_encoder_dp,
     )
     _apply_nextn(model_config, nextn)
@@ -1973,6 +2025,7 @@ def _run_disagg_estimate(
     get_backend,
     get_model,
     engine_step_backend=None,
+    forward_model=None,
     # Common (also accepted by agg / static)
     prefix: int = 0,
     nextn: int = 0,
@@ -2010,6 +2063,7 @@ def _run_disagg_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        forward_model=forward_model,
         enable_encoder_dp=enable_encoder_dp,
     )
     decode_model_config = _build_model_config(
@@ -2023,6 +2077,7 @@ def _run_disagg_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        forward_model=forward_model,
         enable_encoder_dp=enable_encoder_dp,
     )
     # Apply common nextn/MTP overrides to *both* prefill and decode worker

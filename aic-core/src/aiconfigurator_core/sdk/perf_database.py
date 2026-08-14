@@ -2449,6 +2449,7 @@ class PerfDatabase:
             return (1, parsed) if parsed is not None else (0, version)
 
         for framework in ordered_frameworks:
+            fw_dir = os.path.join(system_data_root, framework)
             ks_filter = per_framework_filter[framework]
             fallback_only = per_framework_fallback.get(framework, set())
             fw_versions = sorted(

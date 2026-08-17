@@ -30,6 +30,8 @@ from aiconfigurator.sdk.utils import get_model_config_from_model_path
 from aiconfigurator_core.sdk.common import SupportedSystems
 from aiconfigurator_core.sdk.perf_database import load_system_spec
 
+from .otel import init_otel_tracing
+
 logger = logging.getLogger(__name__)
 
 # ─── Pydantic models ────────────────────────────────────────────────────────
@@ -492,6 +494,8 @@ app = FastAPI(
     version="1.0.0",
     default_response_class=ORJSONResponse,
 )
+
+init_otel_tracing()
 
 app.add_middleware(
     CORSMiddleware,

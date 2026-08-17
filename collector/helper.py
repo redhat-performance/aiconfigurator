@@ -12,6 +12,7 @@ case files; this file should stay focused on reusable execution mechanics.
 
 import csv
 import functools
+import hashlib
 import heapq
 import json
 import logging
@@ -47,6 +48,17 @@ class WorkerRestartSignal:
 
 
 WORKER_RESTART = WorkerRestartSignal()
+
+
+class PerfLogError(RuntimeError):
+    """A measured performance row could not be durably persisted.
+
+    Persistence is part of task completion, so this exception must propagate to
+    the collector executor and classify the case as failed.  Keeping the
+    fail-closed behavior here protects older callers that do not inspect the
+    successful ``True`` return value from :func:`log_perf`.
+    """
+
 
 # Global NVML state per worker process
 _NVML_INITIALIZED = False
@@ -724,11 +736,12 @@ def log_perf(
             time.sleep(0.1)
 
     if not got_lock:
-        print(f"Skipping log: can not get lock for {perf_filename}")
-        return False
+        message = f"Can not get lock for {perf_filename}"
+        print(f"Error writing log: {message}")
+        raise PerfLogError(message)
 
     try:
-        with open(perf_filename, "a", newline="") as f:
+        with open(perf_filename, "a+", newline="") as f:
             # Add header only if file is empty
             is_empty = os.fstat(f.fileno()).st_size == 0
 
@@ -750,6 +763,25 @@ def log_perf(
                     if key not in fieldnames:
                         fieldnames.append(key)
 
+            # The first row freezes the staging schema. A resumed or batched
+            # run must never append with a different optional-column setting
+            # (most notably --measure_power), because DictWriter would emit
+            # values in the NEW order under the OLD header. Validate under the
+            # same writer lock before appending so the file remains unchanged
+            # on mismatch and the caller can classify the failed persistence.
+            if not is_empty:
+                f.seek(0)
+                existing_header = next(csv.reader(f), [])
+                if existing_header != fieldnames:
+                    message = (
+                        f"Schema mismatch for {perf_filename}: "
+                        f"existing header {existing_header}, requested header {fieldnames}. "
+                        "Use the same measurement settings when resuming or start a fresh staging file."
+                    )
+                    print(f"Error writing log: {message}")
+                    raise PerfLogError(message)
+                f.seek(0, os.SEEK_END)
+
             writer = csv.DictWriter(f, fieldnames=fieldnames)
 
             if is_empty:
@@ -766,9 +798,11 @@ def log_perf(
             # Force disk write (for NFS)
             f.flush()
             os.fsync(f.fileno())
+    except PerfLogError:
+        raise
     except Exception as e:
         print(f"Error writing log: {e}")
-        return False
+        raise PerfLogError(f"Failed to write {perf_filename}: {e}") from e
     finally:
         # Delete the lock file, even if writing crashed
         if got_lock and os.path.exists(lock_file):
@@ -948,6 +982,24 @@ def find_perf_csv_outputs(output_root: str | os.PathLike = ".", *, recursive: bo
     root = Path(output_root)
     paths = root.rglob("*_perf.txt") if recursive else root.glob("*_perf.txt")
     return sorted(path for path in paths if path.name != "INCOMPLETE.txt")
+
+
+def stale_output_artifacts(output_dir: str | os.PathLike, perf_filename: str) -> list[str]:
+    """Artifacts a previous standalone-collector attempt left in ``output_dir``.
+
+    ``log_perf`` opens its staging CSV in append mode, so a rerun into a
+    directory holding a prior attempt's rows would append a second run after
+    the stale ones and finalize both under a sidecar that attests only the
+    current plan. Standalone multi-node collectors have no attempt/resume
+    validation, so their only safe behavior is to refuse such a directory.
+    Returns the offending names (relative to ``output_dir``), empty when clean.
+    """
+    directory = Path(output_dir)
+    stem = Path(perf_filename).stem
+    owned: list[str] = []
+    for pattern in (f"{stem}.*", "collection_meta.yaml", "errors_*.json"):
+        owned.extend(sorted(path.name for path in directory.glob(pattern)))
+    return owned
 
 
 def finalize_perf_files(
@@ -1754,36 +1806,90 @@ _AIC_MODEL_CONFIG_DIR = os.path.join(
 
 
 def _materialize_aic_cached_config(model_id: str, slug: str, cached_config: str) -> str:
-    """Copy a bundled AIC config into a deterministic per-model tempdir.
+    """Materialize a bundled AIC config as an immutable per-content snapshot.
 
     ``auto_map`` is stripped so that ``trust_remote_code=True`` consumers
     (e.g. SGLang's ServerArgs) do not try to import ``configuration_*.py``
-    files that AIC does not ship. A deterministic path (no random suffix,
-    no pid) lets parallel subprocesses / pytest-xdist workers converge on
-    the same directory; the JSON write is atomic via ``os.replace``.
-    """
-    tmp_dir = os.path.join(tempfile.gettempdir(), f"aic_model_config_{slug}")
-    os.makedirs(tmp_dir, exist_ok=True)
+    files that AIC does not ship.
 
-    target = os.path.join(tmp_dir, "config.json")
-    if not os.path.exists(target):
-        with open(cached_config) as f:
-            config = json.load(f)
-        config.pop("auto_map", None)
-        tmp_target = f"{target}.{os.getpid()}.tmp"
-        with open(tmp_target, "w") as f:
-            json.dump(config, f)
-        os.replace(tmp_target, target)
+    Snapshots live at ``<tmp>/aic_model_config_<slug>/<content-hash>/`` and
+    are published with ONE atomic directory rename covering ``config.json``
+    and the ``hf_quant_config.json`` side-car together, then never mutated.
+    Readers (e.g. collect_mla_module's normalized-config copytree) can
+    therefore never observe a torn pair — new config with an old or removed
+    side-car — no matter how materialization interleaves with their reads;
+    a bundled update under the same slug publishes a NEW snapshot at a new
+    path while in-flight readers keep their consistent old one (#1487
+    review: write-once staleness, then torn-pair publication). The path is
+    deterministic per (slug, content), so parallel subprocesses /
+    pytest-xdist workers converge on one directory, and losing the
+    publication race is tolerated (same protocol as the normalized-config
+    cache in collector/trtllm/collect_mla_module.py).
+    """
+    base_dir = os.path.join(tempfile.gettempdir(), f"aic_model_config_{slug}")
+
+    with open(cached_config) as f:
+        config = json.load(f)
+    config.pop("auto_map", None)
+    desired = json.dumps(config).encode()
 
     quant_side_car = os.path.join(_AIC_MODEL_CONFIG_DIR, f"{slug}_hf_quant_config.json")
-    quant_target = os.path.join(tmp_dir, "hf_quant_config.json")
-    if os.path.exists(quant_side_car) and not os.path.exists(quant_target):
-        tmp_quant = f"{quant_target}.{os.getpid()}.tmp"
-        shutil.copy(quant_side_car, tmp_quant)
-        os.replace(tmp_quant, quant_target)
+    quant_desired = None
+    if os.path.exists(quant_side_car):
+        with open(quant_side_car, "rb") as f:
+            quant_desired = f.read()
 
-    print(f"Resolved {model_id} from AIC model_configs cache: {tmp_dir}")
-    return tmp_dir
+    hasher = hashlib.sha1(b"config.json\0" + desired)
+    if quant_desired is not None:
+        hasher.update(b"\0hf_quant_config.json\0" + quant_desired)
+    snapshot = os.path.join(base_dir, hasher.hexdigest()[:16])
+
+    if not os.path.exists(os.path.join(snapshot, "config.json")):
+        # mkdtemp, not a pid-derived name: threads share a pid, and a shared
+        # staging path would let one thread rename the dir out from under
+        # another mid-write.
+        os.makedirs(base_dir, exist_ok=True)
+        staging = tempfile.mkdtemp(prefix=f"{os.path.basename(snapshot)}.stage-", dir=base_dir)
+        try:
+            with open(os.path.join(staging, "config.json"), "wb") as f:
+                f.write(desired)
+            if quant_desired is not None:
+                with open(os.path.join(staging, "hf_quant_config.json"), "wb") as f:
+                    f.write(quant_desired)
+            os.replace(staging, snapshot)
+        except OSError:
+            # Another worker may have won the atomic-rename race — but
+            # verify before trusting that assumption: a staged-write or
+            # permission/disk-full failure would otherwise be swallowed.
+            # Either way the staging directory must not linger.
+            shutil.rmtree(staging, ignore_errors=True)
+            if not os.path.exists(os.path.join(snapshot, "config.json")):
+                raise
+
+    print(f"Resolved {model_id} from AIC model_configs cache: {snapshot}")
+    return snapshot
+
+
+def config_norm_cache_key(src: str) -> str:
+    """Cache key (16-hex sha1) for normalized copies of the config dir ``src``.
+
+    Hashes the source path plus the name and bytes of every ``*.json``
+    directly inside it — ``config.json`` AND side-cars like
+    ``hf_quant_config.json``, because normalizers materialize the whole dir
+    (``copytree``) and ``ModelConfig.from_pretrained`` reads the side-cars
+    too. A path-only key would keep serving a stale normalized copy when a
+    bundled config changes under an unchanged path (repo update).
+    """
+    if not os.path.exists(os.path.join(src, "config.json")):
+        raise FileNotFoundError(f"'{src}' does not contain config.json")
+    hasher = hashlib.sha1(src.encode())
+    for name in sorted(os.listdir(src)):
+        if not name.endswith(".json"):
+            continue
+        hasher.update(b"\0" + name.encode() + b"\0")
+        with open(os.path.join(src, name), "rb") as f:
+            hasher.update(f.read())
+    return hasher.hexdigest()[:16]
 
 
 def _resolve_local_model_path(model_id: str) -> str:

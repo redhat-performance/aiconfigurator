@@ -1,0 +1,89 @@
+# Multi-stage AIConfigurator FastAPI service build
+# Stage 1: Build wheels (reuse existing Docker build logic)
+ARG WHEEL_BUILD_BASE=quay.io/pypa/manylinux_2_28_x86_64
+
+FROM ${WHEEL_BUILD_BASE} AS wheel-builder
+WORKDIR /workspace
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo \
+    PATH=/opt/rust/cargo/bin:${PATH}
+
+# Install Rust toolchain
+RUN curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-connrefused --retry-delay 2 \
+        https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.96.0 \
+    && rm /tmp/rustup-init.sh
+
+ENV UV_PYTHON=/opt/python/cp312-cp312/bin/python3
+
+# Copy source
+COPY src/ /workspace/src/
+COPY aic-core/ /workspace/aic-core/
+COPY LICENSE pyproject.toml README.md /workspace/
+
+# Build wheels
+RUN MATURIN_PEP517_ARGS="--compatibility manylinux_2_28" \
+        uv build --project aic-core --wheel --out-dir /workspace/dist && \
+    cd /workspace && uv build --wheel --out-dir /workspace/dist
+
+# Stage 2: Base runtime image
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH=/opt/venv/bin:${PATH}
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for container execution
+RUN groupadd -r aiconfigurator && useradd -r -g aiconfigurator -u 1001 aiconfigurator
+
+# Create virtual environment
+RUN python -m venv /opt/venv
+
+# Copy wheels from builder
+COPY --from=wheel-builder /workspace/dist /wheelhouse
+
+# Install wheels
+RUN /opt/venv/bin/pip install --upgrade pip setuptools wheel && \
+    /opt/venv/bin/pip install --find-links /wheelhouse /wheelhouse/aiconfigurator-*.whl && \
+    rm -rf /wheelhouse
+
+# Install FastAPI runtime dependencies
+RUN /opt/venv/bin/pip install \
+    fastapi \
+    uvicorn[standard] \
+    valkey \
+    orjson \
+    pandas \
+    opentelemetry-api \
+    opentelemetry-sdk \
+    opentelemetry-exporter-otlp-proto-http \
+    opentelemetry-instrumentation-fastapi \
+    opentelemetry-instrumentation-requests \
+    opentelemetry-instrumentation-urllib3
+
+# Copy FastAPI application
+COPY tools/api_service /app/api_service
+
+# Set ownership and permissions for aiconfigurator user
+RUN chown -R aiconfigurator:aiconfigurator /app /opt/venv && \
+    chmod -R u+rwX,g+rX,o-rwx /app
+
+# Expose port for API (will be mapped per instance: 7860, 7861, 7862)
+EXPOSE 7860
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD /opt/venv/bin/python -c "import requests; requests.get('http://localhost:7860/systems')" || exit 1
+
+# Run uvicorn server
+CMD ["uvicorn", "api_service.app:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "2"]

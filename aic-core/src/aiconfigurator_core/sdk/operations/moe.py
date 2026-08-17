@@ -87,6 +87,7 @@ def _cache_key(database: PerfDatabase) -> tuple:
 _MOE_QUANT_UTIL_LEVEL: dict[tuple[float, float], float] = {
     (2, 1): 0.53,  # w16a16 / bfloat16              [data]
     (1, 1): 0.45,  # w8a16                          [inferred]
+    (0.5625, 1): 0.07,  # w4a16+scales / nvfp4_wo (Marlin FP4, weight-only BF16) [copies measured (0.5,1)]
     (0.5, 1): 0.07,  # w4a16 (int4_wo, mxfp4)       [data]
     (1, 2): 0.40,  # w8a8 / fp8(_block)             [data]
     (0.5, 2): 0.15,  # w4a8 (w4afp8, mxfp4_mxfp8)   [data]
@@ -872,6 +873,7 @@ class MoEDispatch(Operation):
         self._quant_mode = kwargs.get("quant_mode")
         self._reduce_results = kwargs.get("reduce_results", True)
         self._attn_cp_size = kwargs.get("attn_cp_size", 1)
+        self._attn_ar_modeled = kwargs.get("attn_ar_modeled", False)
 
     # ------------------------------------------------------------------
     # Data ownership
@@ -1124,10 +1126,11 @@ class MoEDispatch(Operation):
             else:
                 data = node_data
                 # 2-axis grid (sms, tokens). Only sm=20 is collected today, so an
-                # off-grid sms snaps to the nearest collected value (the legacy
-                # 2-D scattered interp simply failed on a single-sms cloud);
-                # tokens use the linear proxy SOL (see the DeepEP ll note; SOL is
-                # constant in sms — no data supports an sms scaling story yet).
+                # off-grid sms resolves through the hold path (joint-log kNN
+                # util transfer; the legacy 2-D scattered interp simply failed
+                # on a single-sms cloud); tokens use the linear proxy SOL (see
+                # the DeepEP ll note; SOL is constant in sms — no data supports
+                # an sms scaling story yet).
                 config = perf_interp.OpInterpConfig(
                     axes=("sms", "num_tokens"),
                     resolver=perf_interp.Grid(),
@@ -1293,8 +1296,11 @@ class MoEDispatch(Operation):
 
             comm_latency = 0
 
-            # Add allreduce latency when TP > 1
-            if self._attention_tp_size > 1:
+            # vLLM's FusedMoE has no pre-dispatch collective when attention_dp == 1;
+            # the pre-dispatch AR here doubles as the attention-output all-reduce
+            # for models that do not compose it explicitly. Models that price that
+            # AR themselves pass attn_ar_modeled=True.
+            if self._attention_tp_size > 1 and not (self._pre_dispatch and self._attn_ar_modeled):
                 comm_latency += database.query_custom_allreduce(common.CommQuantMode.half, self.num_gpus, volume)
 
             if self._attention_dp_size > 1:

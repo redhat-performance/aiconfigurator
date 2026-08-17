@@ -18,13 +18,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::error::AicError;
 use crate::operators::{
-    ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, DsaModuleOp, Dsv4MegaMoeOp,
-    Dsv4ModuleOp,
-    ElementwiseOp, EmbeddingOp, EncoderAttentionOp, GdnOp, GemmOp, GenerationAttentionOp,
-    GenerationMlaOp, KdaOp, Mamba2Op, MhcModuleOp, MlaBmmOp, MlaModuleOp, MoEDispatchOp, MoeOp,
-    MsaModuleOp, TrtllmWideEpMoEDispatchOp,
-    NcclOp, P2POp, PerformanceResult, Source, VisionEncoderOp, WideEpContextMlaOp,
-    WideEpGenerationMlaOp, WideEpMoeOp,
+    ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, DsaModuleOp, Dsv4MegaMoeOp, Dsv4ModuleOp,
+    ElementwiseOp, EmbeddingOp, EncoderAttentionOp, FpmForwardOp, GdnOp, GemmOp,
+    GenerationAttentionOp, GenerationMlaOp, KdaOp, Mamba2Op, MhcModuleOp, MlaBmmOp, MlaModuleOp,
+    MoEDispatchOp, MoeAllToAllOp, MoeExpertComputeOp, MoeOp, MsaModuleOp, NcclOp, P2POp,
+    PerformanceResult, Source, VisionEncoderOp, WideEpContextMlaOp, WideEpGenerationMlaOp,
 };
 use crate::perf_database::PerfDatabase;
 
@@ -127,14 +125,6 @@ pub enum Op {
     /// SGLang WideEP generation MLA — replaces `GenerationMlaOp` in the
     /// `WideEPDeepSeekModel` variant.
     WideEpGenerationMla(WideEpGenerationMlaOp),
-    /// TensorRT-LLM WideEP MoE compute. Used by the
-    /// `TrtllmWideEPDeepSeekModel` variant; dispatch / combine cost is
-    /// modeled separately by `WideEpMoeDispatch`.
-    WideEpMoe(WideEpMoeOp),
-    /// TensorRT-LLM WideEP All2All dispatch (prepare+dispatch / combine).
-    /// Mirrors Python `TrtLLMWideEPMoEDispatch` — a direct `Operation`
-    /// subclass, NOT a `MoEDispatch` flavor.
-    WideEpMoeDispatch(TrtllmWideEpMoEDispatchOp),
     /// Two op groups that execute in parallel on different CUDA streams.
     /// Mirrors Python `aiconfigurator.sdk.operations.overlap.OverlapOp`:
     /// `latency = max(sum(group_a), sum(group_b))`.
@@ -160,8 +150,28 @@ pub enum Op {
     /// `kda_perf` table, an fp32-state SOL byte model, a "verify" phase and
     /// a `draft_tokens` field). APPENDED at the end (see the bincode note on
     /// `Dsv4MegaMoe`); the new serialized variant bumped
-    /// `ENGINE_SPEC_SCHEMA_VERSION` to 5.
+    /// `ENGINE_SPEC_SCHEMA_VERSION` to 5 (renumbered to 6 at its merge).
     Kda(KdaOp),
+    /// Whole-model forward pass (Python `forward_model="fpm"`): with the FPM
+    /// rewrite each phase op list is exactly one of these, answering from the
+    /// collected `fpm_forward_perf` cells instead of a granular composition.
+    /// NOT related to the `crate::fpm` (ForwardPassPerfModel) module.
+    /// APPENDED at the end (see the bincode note on `Dsv4MegaMoe`); claimed
+    /// `ENGINE_SPEC_SCHEMA_VERSION` 5 concurrently with #1460/#1435 and was
+    /// renumbered to 9 across the intervening wire-format landings.
+    FpmForward(FpmForwardOp),
+    /// Unified large-EP MoE all-to-all comm phase (Python
+    /// `operations.moe_comm.MoEAllToAll`) — one variant serves every backend
+    /// and every phase; the op's `phase` / `comm_backend` fields select the
+    /// slice. Measured-SILICON-only; see `operators/moe_a2a.rs`.
+    ///
+    /// APPENDED after `FpmForward` — same positional-index rule as above.
+    MoeAllToAll(MoeAllToAllOp),
+    /// Unified large-EP MoE expert compute (Python
+    /// `operations.moe_comm.MoEExpertCompute`) — one variant for both inference phases;
+    /// the op's `inference_phase` field selects the slice.
+    /// Measured-SILICON-only; see `operators/moe_expert_compute.rs`.
+    MoeExpertCompute(MoeExpertComputeOp),
 }
 
 /// Inline-defined here (rather than a sibling module under `operators/`)
@@ -237,12 +247,13 @@ impl Op {
             Op::Gdn(o) => &o.name,
             Op::WideEpContextMla(o) => &o.name,
             Op::WideEpGenerationMla(o) => &o.name,
-            Op::WideEpMoe(o) => &o.name,
-            Op::WideEpMoeDispatch(o) => &o.name,
+            Op::FpmForward(o) => &o.name,
             Op::Overlap(o) => &o.name,
             Op::Fallback(o) => &o.name,
             Op::Dsv4MegaMoe(o) => &o.name,
             Op::Kda(o) => &o.name,
+            Op::MoeAllToAll(o) => &o.name,
+            Op::MoeExpertCompute(o) => &o.name,
         }
     }
 
@@ -322,27 +333,34 @@ impl Op {
             Op::Gdn(op) => op.query(db, ctx.batch_size, ctx.s),
             Op::WideEpContextMla(op) => op.query(db, ctx.batch_size, ctx.s, ctx.prefix),
             Op::WideEpGenerationMla(op) => op.query(db, ctx.batch_size, ctx.s),
-            Op::WideEpMoe(op) => op.query(db, ctx.num_tokens),
-            Op::WideEpMoeDispatch(op) => op.query(db, ctx.num_tokens),
+            // Whole-model op: consumes batch_size/s/prefix/beam_width from the
+            // context (num_tokens is ignored, mirroring Python's kwargs use).
+            Op::FpmForward(op) => op.query(db, ctx),
             Op::Overlap(op) => {
                 // Mirrors Python `OverlapOp.query`: each group is summed
-                // independently, then `max(group_a_total, group_b_total)` is
-                // returned. Source tag follows the additive combine rule.
+                // independently, then latency = max(group_a_total,
+                // group_b_total) while ENERGY = group_a + group_b (both
+                // groups consume power even though they overlap in time).
+                // Source tag follows the additive combine rule.
                 let mut total_a = 0.0_f64;
+                let mut energy_a = 0.0_f64;
                 let mut source_a: Option<Source> = None;
                 for inner in &op.group_a {
                     let r = inner.query(db, ctx)?;
                     total_a += r.latency_ms;
+                    energy_a += r.energy_wms;
                     source_a = Some(match source_a {
                         None => r.source,
                         Some(prev) => prev.combine(r.source),
                     });
                 }
                 let mut total_b = 0.0_f64;
+                let mut energy_b = 0.0_f64;
                 let mut source_b: Option<Source> = None;
                 for inner in &op.group_b {
                     let r = inner.query(db, ctx)?;
                     total_b += r.latency_ms;
+                    energy_b += r.energy_wms;
                     source_b = Some(match source_b {
                         None => r.source,
                         Some(prev) => prev.combine(r.source),
@@ -353,7 +371,12 @@ impl Op {
                     (Some(s), None) | (None, Some(s)) => s,
                     (None, None) => Source::Silicon,
                 };
-                Ok(PerformanceResult::new(total_a.max(total_b), source).clamp_non_negative())
+                Ok(PerformanceResult::with_energy(
+                    total_a.max(total_b),
+                    energy_a + energy_b,
+                    source,
+                )
+                .clamp_non_negative())
             }
             Op::Fallback(op) => {
                 // Mirrors Python `FallbackOp.query`: try the primary; on
@@ -378,20 +401,31 @@ impl Op {
                         db
                     };
                 match op.primary.query(primary_db, ctx) {
+                    // Primary result passes through verbatim — its energy
+                    // rides along (Python returns `self._primary.query(...)`).
                     Ok(r) => Ok(r),
                     Err(AicError::PerfDatabase(_)) | Err(AicError::Io { .. }) => {
+                        // Fallback chain: Python sums PerformanceResults
+                        // (`total += op.query(...)`), so latency AND energy
+                        // both accumulate.
                         let mut total = 0.0_f64;
+                        let mut energy = 0.0_f64;
                         let mut source: Option<Source> = None;
                         for inner in &op.fallback {
                             let r = inner.query(db, ctx)?;
                             total += r.latency_ms;
+                            energy += r.energy_wms;
                             source = Some(match source {
                                 None => r.source,
                                 Some(prev) => prev.combine(r.source),
                             });
                         }
-                        Ok(PerformanceResult::new(total, source.unwrap_or(Source::Silicon))
-                            .clamp_non_negative())
+                        Ok(PerformanceResult::with_energy(
+                            total,
+                            energy,
+                            source.unwrap_or(Source::Silicon),
+                        )
+                        .clamp_non_negative())
                     }
                     Err(other) => Err(other),
                 }
@@ -403,7 +437,13 @@ impl Op {
             // Like Gdn: the op derives its phase coordinates internally
             // (verify divides the (nextn+1)-scaled batch by draft_tokens).
             Op::Kda(op) => op.query(db, ctx.batch_size, ctx.s),
+            // Both large-EP ops take Python's `x` (moe_comm.py:657, :1291) —
+            // the same per-rank token count every other compute/comm op gets.
+            // The per-op token rescaling (`// attention_tp_size` for the comm
+            // side, `* attention_dp_size` for the compute side) happens INSIDE
+            // each `query`, exactly where Python does it.
+            Op::MoeAllToAll(op) => op.query(db, ctx.num_tokens),
+            Op::MoeExpertCompute(op) => op.query(db, ctx.num_tokens),
         }
     }
 }
-

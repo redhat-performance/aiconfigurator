@@ -62,6 +62,7 @@ logger = logging.getLogger(__name__)
 _GEMM_QUANT_UTIL_LEVEL: dict[tuple[float, float], float] = {
     (2, 1): 0.70,  # w16a16 / bfloat16               [data 0.55-0.79]
     (1, 1): 0.55,  # w8a16 / int8_wo                 [inferred]
+    (0.5625, 1): 0.45,  # w4a16+scales / nvfp4_wo (Marlin FP4, BF16 compute) [copies inferred (0.5,1)]
     (0.5, 1): 0.45,  # w4a16 / int4_wo (fused-dequant weight-only runs below
     #                  the bf16 compute roofline it shares; Marlin-class) [inferred]
     (1, 2): 0.45,  # w8a8 / fp8(_block/_ootb), sq    [data 0.28-0.55]
@@ -200,6 +201,7 @@ class GEMM(Operation):
         self._weights = self._n * self._k * quant_mode.value.memory
         self._scale_num_tokens = kwargs.get("scale_num_tokens", 1)
         self._low_precision_input = kwargs.get("low_precision_input", False)
+        self._below_grid_sol = kwargs.get("below_grid_sol", False)
 
     # ------------------------------------------------------------------
     # Data ownership: load + cache + clear
@@ -469,6 +471,7 @@ class GEMM(Operation):
         k: int,
         quant_mode: common.GEMMQuantMode,
         database_mode: common.DatabaseMode | None = None,
+        below_grid_sol: bool = False,
     ):
         """Query GEMM table — preserves PR #721 exact-hit → 1D → 3D fast path."""
         # Strict eager resolution (parity with the Rust engine, which resolves
@@ -614,6 +617,13 @@ class GEMM(Operation):
             try:
                 result = perf_interp.query(config, gemm_data, m, n, k)
             except InterpolationDataNotAvailableError as exc:
+                # Opt-in: shapes outside the collected grid degrade to SOL
+                # instead of failing SILICON; exact rows win once collected.
+                # Quant-mode misses (above) stay strict, and HYBRID keeps
+                # its empirical fallback. SOL has no energy model, so
+                # energy=0.0 is a known (tiny) undercount in the ledger.
+                if below_grid_sol and database_mode == common.DatabaseMode.SILICON:
+                    return PerformanceResult(get_sol(m, n, k, quant_mode)[0], energy=0.0, source="sol")
                 raise PerfDataNotAvailableError(
                     "GEMM perf data not available for requested shape. "
                     f"system='{database.system}', backend='{database.backend}', version='{database.version}', "
@@ -848,10 +858,11 @@ class GEMM(Operation):
         latency_floor = 0.0
 
         # Query with energy
-        result = database.query_gemm(x, self._n, self._k, quant_mode)
+        result = database.query_gemm(x, self._n, self._k, quant_mode, below_grid_sol=self._below_grid_sol)
         latency = float(result)
         energy = result.energy
         source = getattr(result, "source", "silicon")
+        sol_base = source == "sol"
 
         # Static-FP8 GEMM is modeled from the dynamic FP8 base measurement
         # across backends; subtract the separately collected activation-
@@ -894,7 +905,8 @@ class GEMM(Operation):
         # rather than inventing energy when the latency floor fires.
         latency_clamped = max(latency_floor, latency)
         energy_clamped = max(0.0, energy)
-        if latency_clamped != latency or energy_clamped != energy:
+        # A SOL base clamps back to its own SOL by construction — not an anomaly.
+        if (latency_clamped != latency or energy_clamped != energy) and not sol_base:
             logger.warning(
                 "GEMM.query applied latency SOL floor / non-negative energy clamp. "
                 "op=%s m=%s n=%s k=%s quant_mode=%s post_sub(lat=%.6f, eng=%.6f) floor=%.6f",

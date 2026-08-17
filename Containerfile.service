@@ -83,7 +83,7 @@ EXPOSE 7860
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD /opt/venv/bin/python -c "import requests; requests.get('http://localhost:7860/systems')" || exit 1
+    CMD /opt/venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://localhost:7860/systems', timeout=5)" || exit 1
 
 # Run uvicorn server
 CMD ["uvicorn", "api_service.app:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "2"]

@@ -937,7 +937,7 @@ class TestResolveDsparkNextn:
             lambda _: {"architecture": "KimiK3ForConditionalGeneration"},
         )
         result = resolve_dspark_nextn("moonshotai/Kimi-K3")
-        assert result == 7
+        assert result == (7, 7 * 0.8)
 
     def test_empty_model_path_raises(self):
         from aiconfigurator_core.sdk.config_builders import resolve_dspark_nextn

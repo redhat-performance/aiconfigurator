@@ -540,8 +540,14 @@ class TestCLIRecommendUnit:
         assert captured_kwargs["enable_wideep"] is True
         assert captured_kwargs["moe_backend"] == "deepep_moe"
 
-    def test_dspark_nextn_auto_enabled_via_auto_path(self, monkeypatch):
-        """cli_recommend auto-enables DSPARK when nextn='auto' resolves to 0."""
+    def test_dspark_nextn_auto_enabled(self, monkeypatch):
+        """cli_recommend auto-enables DSPARK via the nextn='auto' → 0 → DSPARK path.
+
+        Exercises the realistic production flow: nextn='auto' calls
+        _resolve_nextn_auto which returns 0 for DSPARK models (block size is not
+        in the checkpoint), then _resolve_dspark_nextn fills in the architectural
+        block size and planning acceptance.
+        """
         import aiconfigurator.cli.api as api
 
         captured = {}
@@ -556,43 +562,17 @@ class TestCLIRecommendUnit:
         monkeypatch.setattr(api, "build_default_tasks", fake_build_default_tasks)
         monkeypatch.setattr(api, "_execute_tasks_internal", fake_execute)
         monkeypatch.setattr(api, "_resolve_nextn_auto", lambda _: 0)
-        monkeypatch.setattr(api, "_resolve_dspark_nextn", lambda _: 7)
+        monkeypatch.setattr(api, "_resolve_dspark_nextn", lambda _: (7, 5.6))
 
         api.cli_recommend(
             model_path="moonshotai/Kimi-K3",
             system="h200_sxm",
             target_concurrency=16,
-            # nextn="auto" by default
+            nextn="auto",
         )
 
         assert captured["nextn"] == 7
-        assert abs(captured["nextn_accepted"] - 7 * api._DSPARK_DEFAULT_ACCEPTANCE) < 1e-9
-
-    def test_dspark_explicit_nextn_zero_opts_out(self, monkeypatch):
-        """Explicit nextn=0 opts out of DSPARK — the model is sized without speculative decoding."""
-        import aiconfigurator.cli.api as api
-
-        captured = {}
-
-        def fake_build_default_tasks(**kwargs):
-            captured.update(kwargs)
-            return {}
-
-        def fake_execute(tasks, mode, **kwargs):
-            return ("agg", {"agg": pd.DataFrame({"x": [1]})}, {}, {}, {}, {})
-
-        monkeypatch.setattr(api, "build_default_tasks", fake_build_default_tasks)
-        monkeypatch.setattr(api, "_execute_tasks_internal", fake_execute)
-        monkeypatch.setattr(api, "_resolve_dspark_nextn", lambda _: 7)
-
-        api.cli_recommend(
-            model_path="moonshotai/Kimi-K3",
-            system="h200_sxm",
-            target_concurrency=16,
-            nextn=0,  # explicit opt-out
-        )
-
-        assert captured["nextn"] == 0
+        assert abs(captured["nextn_accepted"] - 5.6) < 1e-9
 
     def test_dspark_explicit_nextn_accepted_not_overridden(self, monkeypatch):
         """Explicit nextn_accepted is preserved when DSPARK is auto-detected."""
@@ -609,8 +589,7 @@ class TestCLIRecommendUnit:
 
         monkeypatch.setattr(api, "build_default_tasks", fake_build_default_tasks)
         monkeypatch.setattr(api, "_execute_tasks_internal", fake_execute)
-        monkeypatch.setattr(api, "_resolve_nextn_auto", lambda _: 0)
-        monkeypatch.setattr(api, "_resolve_dspark_nextn", lambda _: 7)
+        monkeypatch.setattr(api, "_resolve_dspark_nextn", lambda _: (7, 5.6))
 
         api.cli_recommend(
             model_path="moonshotai/Kimi-K3",
@@ -623,7 +602,7 @@ class TestCLIRecommendUnit:
         assert captured["nextn_accepted"] == 3.0
 
     def test_non_dspark_model_unaffected(self, monkeypatch):
-        """Non-DSPARK models resolve to nextn=0 and stay there."""
+        """Non-DSPARK models are not touched by the DSPARK auto-detect path."""
         import aiconfigurator.cli.api as api
 
         captured = {}
@@ -637,7 +616,6 @@ class TestCLIRecommendUnit:
 
         monkeypatch.setattr(api, "build_default_tasks", fake_build_default_tasks)
         monkeypatch.setattr(api, "_execute_tasks_internal", fake_execute)
-        monkeypatch.setattr(api, "_resolve_nextn_auto", lambda _: 0)
         monkeypatch.setattr(api, "_resolve_dspark_nextn", lambda _: None)
 
         api.cli_recommend(

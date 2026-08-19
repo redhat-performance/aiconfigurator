@@ -2,7 +2,7 @@ name: Build fixed container image
 
 on:
   push:
-    branches: [fix/openshift-permissions]
+    branches: [fixed_container]
   workflow_dispatch:
 
 concurrency:

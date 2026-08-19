@@ -3,9 +3,8 @@ name: Build and Push AIConfigurator Image
 on:
   push:
     branches: [deploy/api]
-    paths-ignore:
-      - 'docs/**'
-      - '**.md'
+    tags:
+      - 'deploy-api-v*'
 
 concurrency:
   group: build-api
@@ -22,6 +21,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0  # Full git history for git describe
           lfs: true
 
       - name: Set up Docker Buildx
@@ -40,8 +40,9 @@ jobs:
         with:
           images: ghcr.io/redhat-performance/aiconfigurator
           tags: |
-            type=raw,value=latest
-            type=sha,prefix={{branch}}-
+            type=match,pattern=deploy-api-v(.*),group=1
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/deploy-api-v') }}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/deploy/api' }}
 
       - name: Build and push
         uses: docker/build-push-action@v5

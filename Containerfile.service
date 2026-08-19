@@ -76,7 +76,7 @@ COPY tools/api_service /app/api_service
 
 # Set ownership and permissions for aiconfigurator user
 RUN chown -R aiconfigurator:aiconfigurator /app /opt/venv && \
-    chmod -R u+rwX,g+rX,o-rwx /app
+    chmod -R u+rwX,g+rX,o+rX /app
 
 # Expose port for API (will be mapped per instance: 7860, 7861, 7862)
 EXPOSE 7860

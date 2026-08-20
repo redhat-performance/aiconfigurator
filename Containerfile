@@ -43,9 +43,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user for container execution
-RUN groupadd -r aiconfigurator && useradd -r -g aiconfigurator -u 1001 aiconfigurator
-
 # Create virtual environment
 RUN python -m venv /opt/venv
 
@@ -74,9 +71,12 @@ RUN /opt/venv/bin/pip install \
 # Copy FastAPI application
 COPY tools/api_service /app/api_service
 
-# Set ownership and permissions for aiconfigurator user
-RUN chown -R aiconfigurator:aiconfigurator /app /opt/venv && \
-    chmod -R u+rwX,g+rX,o-rwx /app
+# Set ownership and permissions for OpenShift compatibility
+# Use numeric UID 1001 and group 0 (root group) for arbitrary UID support
+RUN chown -R 1001:0 /app /opt/venv && \
+    chmod -R g=u /app /opt/venv
+
+USER 1001
 
 # Expose port for API (will be mapped per instance: 7860, 7861, 7862)
 EXPOSE 7860

@@ -24,6 +24,7 @@ from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from aiconfigurator.cli.api import cli_estimate, cli_recommend
+from aiconfigurator.sdk.errors import NoFeasibleConfigError
 from aiconfigurator.sdk.common import get_default_models
 from aiconfigurator.sdk.memory import estimate_kv_cache
 from aiconfigurator.sdk.utils import get_model_config_from_model_path
@@ -460,6 +461,8 @@ def _build_memory_breakdown(
 
 def _common_error_handler(e: Exception, op: str, model_path: str, backend: str, system: str) -> None:
     msg = str(e)
+    if isinstance(e, NoFeasibleConfigError):
+        raise HTTPException(status_code=422, detail=msg)
     if isinstance(e, (ValueError, AttributeError)):
         if "system_spec" in msg or "NoneType" in msg or "unsupported model" in msg.lower():
             detail = f"No performance data available for model={model_path}, backend={backend}, system={system}."
@@ -467,7 +470,6 @@ def _common_error_handler(e: Exception, op: str, model_path: str, backend: str, 
         raise HTTPException(status_code=422, detail=msg)
     logger.exception("%s failed", op)
     raise HTTPException(status_code=500, detail=msg)
-
 
 def _architecture_from_sm(sm_version: int) -> str:
     return _SM_ARCHITECTURE.get(sm_version, f"sm_{sm_version}")
@@ -525,8 +527,23 @@ def post_recommend(
                 prefix=req.prefix,
                 top_n=req.top_n,
             )
-    except (ValueError, AttributeError, Exception) as e:
-        _common_error_handler(e, "recommend", req.model_path, req.backend, req.system)
+    except NoFeasibleConfigError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except AttributeError as e:
+        msg = str(e)
+        if "system_spec" in msg or "NoneType" in msg:
+            raise HTTPException(
+                status_code=422,
+                detail=f"No performance data available for model={req.model_path}, backend={req.backend}, system={req.system}.",
+            )
+        logger.exception("recommend failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception("recommend failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
     best = result.best_configs.get(result.chosen_exp)
     chosen = result.chosen_exp
@@ -729,13 +746,13 @@ def _model_specs(model_id: str) -> dict:
 
 @app.get("/models")
 def get_models(
-    include: str | None = Query(default=None, examples=["specs"], description="Comma-separated extras: specs."),
+    detailed: bool = Query(False, description="whether to return detailed model information"),
 ):
-    """List supported models."""
-    models = sorted(get_default_models())
-    if include and "specs" in _parse_include(include):
-        return {"models": [_model_specs(m) for m in models]}
-    return {"models": models}
+    default_models = sorted(get_default_models())
+    if not detailed:
+        return {"models": default_models}
+    else:
+        return {"models": [get_model_config_from_model_path(model) for model in default_models]}
 
 
 @app.get("/systems")
@@ -748,27 +765,27 @@ def get_systems(
 
     systems = []
     for sys_id in sorted(SupportedSystems):
-        entry: dict[str, Any] = {
-            "id": sys_id,
-            "name": _system_display_name(sys_id),
-        }
-        if want_specs:
-            try:
-                spec = load_system_spec(sys_id)
+        entry: dict[str, Any] = {"id": sys_id}
+        try:
+            spec = load_system_spec(sys_id)
+            misc = spec.get("misc", {})
+            entry["name"] = misc.get("name", sys_id)
+            if want_specs:
                 gpu = spec.get("gpu", {})
                 node = spec.get("node", {})
                 sm = int(gpu.get("sm_version", 0))
                 entry.update({
-                    "vendor": "nvidia",
+                    "vendor": misc.get("vendor", "unknown"),
                     "architecture": _architecture_from_sm(sm),
                     "memory_bytes": int(gpu.get("mem_capacity", 0)),
-                    "memory_bandwidth_bytes": int(gpu.get("mem_bw", 0)),
-                    "bf16_tflops": float(gpu.get("bfloat16_tc_flops", 0)) / 1e12,
                     "tdp_watts": float(gpu.get("power", 0)),
                     "gpus_per_node": int(node.get("num_gpus_per_node", 0)),
+                    "memory_bandwidth_bytes": int(gpu.get("mem_bw", 0)),
+                    "bf16_tflops": gpu.get("bfloat16_tc_flops", 0) / 1e12,
                 })
-            except Exception:
-                logger.warning("failed to load spec for %s", sys_id)
+        except Exception:
+            logger.warning("failed to load spec for %s", sys_id)
+            entry.setdefault("name", sys_id)
         systems.append(entry)
     return {"systems": systems}
 
